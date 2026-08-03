@@ -43,14 +43,31 @@ cp .env.example .env
 docker compose up --build          # postgres + redis + api
 ```
 
-Without Docker:
+Without Docker (macOS):
 
 ```bash
+brew install postgresql@16 redis
+brew services start postgresql@16 && brew services start redis
+createuser -s lumen && createdb -O lumen lumen
+
 npm install
-npm run migrate       # applies migrations/*.sql once each, in order
-npm run seed          # optional demo account: demo@lumeniot.local / demo-password-123
-npm run dev
+cp .env.example .env          # then set JWT_SECRET and MQTT_PASSWORD
+npm run migrate               # applies migrations/*.sql once each, in order
+npm run seed                  # optional demo data
+npm start                     # or npm run dev for a watch build
 ```
+
+`.env` is loaded automatically by every script via Node's
+`--env-file-if-exists`; there is no dotenv dependency.
+
+> **Everything that runs, runs from `dist/`.** Node's `--experimental-strip-types`
+> does not rewrite `./x.js` specifiers to `./x.ts`, so executing the sources
+> directly fails on the first runtime import. `migrate`, `seed` and `dev` build
+> first.
+
+If a dependency is missing, the API refuses to start with a message naming the
+service, the address it tried, and how to start it — rather than a driver stack
+trace.
 
 Migrations also run automatically at boot, so a fresh container is ready with no
 extra step.
@@ -77,6 +94,51 @@ All routes are JSON. Authenticated routes take `Authorization: Bearer <access>`.
 | POST | `/logout` | revokes one refresh token |
 | POST | `/logout-all` | revokes every session |
 | POST | `/forgot-password` · `/reset-password` | reset flow; reset revokes all sessions |
+| POST | `/otp/request` | phone → `{ requestId, expiresInSeconds }` |
+| POST | `/otp/verify` | `{ requestId, code }` → tokens; creates the account on first use |
+
+#### Phone + OTP login
+
+```bash
+curl -XPOST localhost:4000/api/auth/otp/request \
+  -H 'content-type: application/json' -d '{"phone":"+91 98765 43210"}'
+# { "requestId":"…", "phone":"********3210", "expiresInSeconds":300, "debugCode":"111111" }
+
+curl -XPOST localhost:4000/api/auth/otp/verify \
+  -H 'content-type: application/json' -d '{"requestId":"…","code":"111111"}'
+# { "accessToken":"…", "refreshToken":"…", "created":true, "user":{…} }
+```
+
+There is no separate phone signup: possession of the number *is* the
+registration, so first verify creates the user and their first home.
+
+> **The code is currently static — `111111`, accepted for every number.** That
+> means anyone can sign in as anyone. It is a stand-in for a real gateway, and
+> the API **refuses to boot in production** on this provider unless
+> `OTP_ALLOW_INSECURE_IN_PRODUCTION=true` is set explicitly. Don't set it.
+
+Everything around delivery is already production-shaped, so only delivery is
+stubbed:
+
+- codes are stored **hashed** with the phone, never in plaintext
+- **single use** — the challenge is deleted on success, so a captured code
+  cannot be replayed
+- **attempt limit** (`OTP_MAX_ATTEMPTS`) kills the challenge, so a 6-digit code
+  cannot be brute-forced; a wrong guess does **not** extend the expiry
+- **resend cooldown** + hourly ceiling per number, so nobody can pump messages
+  at someone else's phone
+- `/otp/request` answers identically whether or not the number has an account,
+  so it cannot be used to test who is registered
+- responses and logs carry a **masked** number (`********3210`), never the full one
+
+Going live is: implement `SmsOtpProvider.deliver` in
+[`src/auth/otp.ts`](src/auth/otp.ts) and set `OTP_PROVIDER=sms`. That provider
+already generates a real random code of `OTP_CODE_LENGTH` digits and never
+echoes `debugCode`. No route, schema or client change.
+
+Accounts may now hold an email identity, a phone identity, or both — a
+phone-only account has no password, and the password-confirmed endpoints say so
+rather than failing obscurely.
 
 ### Profile — `/api`
 
