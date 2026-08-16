@@ -338,7 +338,20 @@ async function handleMessage(topic: string, payload: string, retained: boolean):
   }
 
   // Fan out to WebSocket clients on every API instance, not just this one.
-  await publisher.publish(CHANNEL_DEVICE_UPDATE, JSON.stringify(update));
+  // `retained` travels with it: a retained replay is the broker's memory, not
+  // evidence the device is up, and a client that treated it as live traffic
+  // would show a dead device as online.
+  await publisher.publish(
+    CHANNEL_DEVICE_UPDATE,
+    JSON.stringify({
+      ...update,
+      retained,
+      // Presence read off an availability topic is authoritative (the Last Will
+      // keeps it honest); anything else is inferred from traffic. Clients need
+      // to know which, to age it correctly.
+      ...(update.status ? { statusSource: 'status_topic' } : {}),
+    }),
+  );
 }
 
 /**
