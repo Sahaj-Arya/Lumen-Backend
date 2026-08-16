@@ -10,19 +10,19 @@ import {
 
 describe('parseDeviceTopic', () => {
   it('recognises each well-known topic kind', () => {
-    assert.deepEqual(parseDeviceTopic('devices/esp32-01/status'), {
+    assert.deepEqual(parseDeviceTopic('devices/esp32-01/availability'), {
       deviceUid: 'esp32-01',
-      kind: 'status',
-      key: 'status',
+      kind: 'availability',
+      key: 'availability',
     });
     assert.deepEqual(parseDeviceTopic('devices/s1/state'), {
       deviceUid: 's1',
       kind: 'state',
       key: null,
     });
-    assert.deepEqual(parseDeviceTopic('devices/s1/meta'), {
+    assert.deepEqual(parseDeviceTopic('devices/s1/attributes'), {
       deviceUid: 's1',
-      kind: 'meta',
+      kind: 'attributes',
       key: null,
     });
     assert.deepEqual(parseDeviceTopic('devices/s1/telemetry'), {
@@ -30,9 +30,34 @@ describe('parseDeviceTopic', () => {
       kind: 'telemetry',
       key: null,
     });
+    assert.deepEqual(parseDeviceTopic('devices/s1/set'), {
+      deviceUid: 's1',
+      kind: 'command',
+      key: null,
+    });
+  });
+
+  it('still parses the names this platform used before the standard ones', () => {
+    // Firmware in the field publishes these; ingest must not regress.
+    assert.deepEqual(parseDeviceTopic('devices/s1/status'), {
+      deviceUid: 's1',
+      kind: 'availability',
+      key: 'status',
+    });
+    assert.deepEqual(parseDeviceTopic('devices/s1/meta'), {
+      deviceUid: 's1',
+      kind: 'attributes',
+      key: null,
+    });
     assert.deepEqual(parseDeviceTopic('devices/s1/cmd'), {
       deviceUid: 's1',
-      kind: 'cmd',
+      kind: 'command',
+      key: null,
+    });
+    // Zigbee2MQTT puts the whole state object on the bare device topic.
+    assert.deepEqual(parseDeviceTopic('devices/s1'), {
+      deviceUid: 's1',
+      kind: 'state',
       key: null,
     });
   });

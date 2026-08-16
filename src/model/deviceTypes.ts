@@ -1,9 +1,25 @@
 /**
  * Device type catalogue — the authoritative copy for the platform.
  *
- * A type declares two things:
- *  - `readings`:  values the device *reports* (device -> broker -> here)
- *  - `controls`:  values the app/automation may *set* (here -> broker -> device)
+ * Names and values follow the Home Assistant MQTT integration rather than
+ * anything invented here, because that is what the rest of the ecosystem
+ * speaks: Tasmota, ESPHome, Zigbee2MQTT and Shelly all publish this vocabulary,
+ * and anything that already understands them understands our devices too.
+ * Concretely that means:
+ *
+ *  - a switchable thing reports `state` as "ON"/"OFF", never power/on/true
+ *  - `brightness` is 0-255, `color_temp` is mireds, `position` is 0-100
+ *  - `power` means watts and `energy` means kWh, per device_class
+ *  - sensors carry a `deviceClass` and `unit`, so a client can render one
+ *    without knowing the device
+ *
+ * A type declares:
+ *  - `component`:  the Home Assistant component the device is discovered as
+ *  - `readings`:   values the device *reports* (device -> broker -> here)
+ *  - `controls`:   values the app/automation may *set* (here -> broker -> device)
+ *
+ * `aliases` carry the pre-standard names this platform used to use, so older
+ * firmware keeps ingesting correctly and its readings land on the modern key.
  *
  * The broker itself is schema-free, so this is presentation and validation
  * only: an unknown device still works as `generic` with every reading shown.
@@ -12,6 +28,20 @@
  */
 
 export type ValueKind = 'number' | 'boolean' | 'enum' | 'string';
+
+/** The Home Assistant components a device is discovered as. */
+export type HaComponent =
+  | 'light'
+  | 'switch'
+  | 'sensor'
+  | 'binary_sensor'
+  | 'cover'
+  | 'lock'
+  | 'fan'
+  | 'climate'
+  | 'valve'
+  | 'siren'
+  | 'camera';
 
 export interface ReadingSpec {
   key: string;
@@ -22,7 +52,11 @@ export interface ReadingSpec {
   max?: number;
   /** Allowed values when kind is 'enum'. */
   values?: string[];
-  /** Names firmware may use for this same reading. */
+  /** Home Assistant device_class, which decides icon and formatting there. */
+  deviceClass?: string;
+  /** Home Assistant state_class, for values that belong on a graph. */
+  stateClass?: 'measurement' | 'total' | 'total_increasing';
+  /** Names firmware may use for this same reading, old platform names included. */
   aliases?: string[];
   /** Shown on the device card when present. Order = preference. */
   primary?: boolean;
@@ -46,31 +80,77 @@ export interface DeviceTypeSpec {
   label: string;
   icon: string;
   category: 'lighting' | 'power' | 'climate' | 'security' | 'sensor' | 'water' | 'energy' | 'other';
+  /** Component used in the discovery topic: homeassistant/<component>/<uid>/config */
+  component: HaComponent;
+  /** Component-level device_class — 'garage' on a cover, 'motion' on a binary sensor. */
+  deviceClass?: string;
   readings: ReadingSpec[];
   controls: ControlSpec[];
 }
 
 // ── reusable pieces ────────────────────────────────────────────────
-const POWER_CONTROL: ControlSpec = {
-  key: 'power',
+/**
+ * The on/off value. Home Assistant calls it `state` with "ON"/"OFF"; this
+ * platform used to call it `power` with "on"/"off", which now collides with
+ * the `power` device_class (watts) — hence the rename, with the old name kept
+ * as an alias so existing firmware still lands on the right key.
+ */
+const STATE_CONTROL: ControlSpec = {
+  key: 'state',
   label: 'Power',
   kind: 'toggle',
-  onValue: 'on',
-  offValue: 'off',
-  aliases: ['state', 'switch', 'relay', 'on'],
+  onValue: 'ON',
+  offValue: 'OFF',
+  aliases: ['power', 'switch', 'relay', 'on'],
 };
 
-const POWER_READING: ReadingSpec = {
-  key: 'power',
+const STATE_READING: ReadingSpec = {
+  key: 'state',
   label: 'Power',
   kind: 'enum',
-  values: ['on', 'off'],
-  aliases: ['state', 'switch', 'relay'],
+  values: ['ON', 'OFF'],
+  aliases: ['power', 'switch', 'relay'],
   primary: true,
 };
 
-const RSSI: ReadingSpec = { key: 'rssi', label: 'Signal', kind: 'number', unit: 'dBm' };
-const UPTIME: ReadingSpec = { key: 'uptime', label: 'Uptime', kind: 'number', unit: 's' };
+const BRIGHTNESS_READING: ReadingSpec = {
+  key: 'brightness',
+  label: 'Brightness',
+  kind: 'number',
+  min: 0,
+  max: 255,
+  aliases: ['level', 'dim'],
+  primary: true,
+};
+
+const BRIGHTNESS_CONTROL: ControlSpec = {
+  key: 'brightness',
+  label: 'Brightness',
+  kind: 'stepper',
+  min: 0,
+  max: 255,
+  step: 25,
+  aliases: ['level', 'dim'],
+};
+
+const RSSI: ReadingSpec = {
+  key: 'signal_strength',
+  label: 'Signal',
+  kind: 'number',
+  unit: 'dBm',
+  deviceClass: 'signal_strength',
+  stateClass: 'measurement',
+  aliases: ['rssi'],
+};
+
+const UPTIME: ReadingSpec = {
+  key: 'uptime',
+  label: 'Uptime',
+  kind: 'number',
+  unit: 's',
+  deviceClass: 'duration',
+};
+
 const BATTERY: ReadingSpec = {
   key: 'battery',
   label: 'Battery',
@@ -78,15 +158,21 @@ const BATTERY: ReadingSpec = {
   unit: '%',
   min: 0,
   max: 100,
+  deviceClass: 'battery',
+  stateClass: 'measurement',
 };
-const TEMP: ReadingSpec = {
-  key: 'temp',
+
+const TEMPERATURE: ReadingSpec = {
+  key: 'temperature',
   label: 'Temperature',
   kind: 'number',
   unit: '°C',
-  aliases: ['temperature'],
+  deviceClass: 'temperature',
+  stateClass: 'measurement',
+  aliases: ['temp'],
   primary: true,
 };
+
 const HUMIDITY: ReadingSpec = {
   key: 'humidity',
   label: 'Humidity',
@@ -94,6 +180,46 @@ const HUMIDITY: ReadingSpec = {
   unit: '%',
   min: 0,
   max: 100,
+  deviceClass: 'humidity',
+  stateClass: 'measurement',
+};
+
+const WATTS: ReadingSpec = {
+  key: 'power',
+  label: 'Power draw',
+  kind: 'number',
+  unit: 'W',
+  deviceClass: 'power',
+  stateClass: 'measurement',
+  aliases: ['watts', 'power_w'],
+  primary: true,
+};
+
+const ENERGY: ReadingSpec = {
+  key: 'energy',
+  label: 'Energy',
+  kind: 'number',
+  unit: 'kWh',
+  deviceClass: 'energy',
+  stateClass: 'total_increasing',
+};
+
+const VOLTAGE: ReadingSpec = {
+  key: 'voltage',
+  label: 'Voltage',
+  kind: 'number',
+  unit: 'V',
+  deviceClass: 'voltage',
+  stateClass: 'measurement',
+};
+
+const CURRENT: ReadingSpec = {
+  key: 'current',
+  label: 'Current',
+  kind: 'number',
+  unit: 'A',
+  deviceClass: 'current',
+  stateClass: 'measurement',
 };
 
 export const DEVICE_TYPES: Record<string, DeviceTypeSpec> = {
@@ -102,30 +228,26 @@ export const DEVICE_TYPES: Record<string, DeviceTypeSpec> = {
     label: 'Light',
     icon: 'bulb',
     category: 'lighting',
-    readings: [
-      POWER_READING,
-      { key: 'brightness', label: 'Brightness', kind: 'number', unit: '%', min: 0, max: 100, aliases: ['level', 'dim'], primary: true },
-      RSSI,
-    ],
-    controls: [
-      POWER_CONTROL,
-      { key: 'brightness', label: 'Brightness', kind: 'stepper', min: 0, max: 100, step: 10, unit: '%', aliases: ['level', 'dim'] },
-    ],
+    component: 'light',
+    readings: [STATE_READING, BRIGHTNESS_READING, RSSI],
+    controls: [STATE_CONTROL, BRIGHTNESS_CONTROL],
   },
   rgb_light: {
     label: 'RGB light',
     icon: 'color-palette',
     category: 'lighting',
+    component: 'light',
     readings: [
-      POWER_READING,
-      { key: 'brightness', label: 'Brightness', kind: 'number', unit: '%', min: 0, max: 100 },
-      { key: 'color', label: 'Colour', kind: 'string' },
-      { key: 'temperature', label: 'White temp', kind: 'number', unit: 'K', min: 2000, max: 6500 },
+      STATE_READING,
+      { ...BRIGHTNESS_READING, primary: false },
+      { key: 'color', label: 'Colour', kind: 'string', aliases: ['rgb_color'] },
+      // Mireds, not kelvin: that is what the light component publishes.
+      { key: 'color_temp', label: 'White temp', kind: 'number', unit: 'mired', min: 153, max: 500, aliases: ['temperature'] },
       { key: 'effect', label: 'Effect', kind: 'enum', values: ['none', 'fade', 'strobe', 'rainbow'] },
     ],
     controls: [
-      POWER_CONTROL,
-      { key: 'brightness', label: 'Brightness', kind: 'stepper', min: 0, max: 100, step: 10, unit: '%' },
+      STATE_CONTROL,
+      BRIGHTNESS_CONTROL,
       { key: 'effect', label: 'Effect', kind: 'enum', values: ['none', 'fade', 'strobe', 'rainbow'] },
     ],
   },
@@ -135,37 +257,35 @@ export const DEVICE_TYPES: Record<string, DeviceTypeSpec> = {
     label: 'Smart plug',
     icon: 'flash',
     category: 'power',
-    readings: [
-      POWER_READING,
-      { key: 'watts', label: 'Power draw', kind: 'number', unit: 'W', aliases: ['power_w'], primary: true },
-      { key: 'voltage', label: 'Voltage', kind: 'number', unit: 'V' },
-      { key: 'current', label: 'Current', kind: 'number', unit: 'A' },
-      { key: 'energy', label: 'Energy', kind: 'number', unit: 'kWh' },
-    ],
-    controls: [POWER_CONTROL],
+    component: 'switch',
+    deviceClass: 'outlet',
+    readings: [STATE_READING, WATTS, VOLTAGE, CURRENT, ENERGY],
+    controls: [STATE_CONTROL],
   },
   switch: {
     label: 'Switch',
     icon: 'toggle',
     category: 'power',
-    readings: [POWER_READING, RSSI],
-    controls: [POWER_CONTROL],
+    component: 'switch',
+    readings: [STATE_READING, RSSI],
+    controls: [STATE_CONTROL],
   },
   relay: {
     label: 'Relay board',
     icon: 'git-network',
     category: 'power',
+    component: 'switch',
     readings: [
-      { key: 'ch1', label: 'Channel 1', kind: 'enum', values: ['on', 'off'], primary: true },
-      { key: 'ch2', label: 'Channel 2', kind: 'enum', values: ['on', 'off'] },
-      { key: 'ch3', label: 'Channel 3', kind: 'enum', values: ['on', 'off'] },
-      { key: 'ch4', label: 'Channel 4', kind: 'enum', values: ['on', 'off'] },
+      { key: 'ch1', label: 'Channel 1', kind: 'enum', values: ['ON', 'OFF'], primary: true },
+      { key: 'ch2', label: 'Channel 2', kind: 'enum', values: ['ON', 'OFF'] },
+      { key: 'ch3', label: 'Channel 3', kind: 'enum', values: ['ON', 'OFF'] },
+      { key: 'ch4', label: 'Channel 4', kind: 'enum', values: ['ON', 'OFF'] },
     ],
     controls: [
-      { key: 'ch1', label: 'Channel 1', kind: 'toggle', onValue: 'on', offValue: 'off' },
-      { key: 'ch2', label: 'Channel 2', kind: 'toggle', onValue: 'on', offValue: 'off' },
-      { key: 'ch3', label: 'Channel 3', kind: 'toggle', onValue: 'on', offValue: 'off' },
-      { key: 'ch4', label: 'Channel 4', kind: 'toggle', onValue: 'on', offValue: 'off' },
+      { key: 'ch1', label: 'Channel 1', kind: 'toggle', onValue: 'ON', offValue: 'OFF' },
+      { key: 'ch2', label: 'Channel 2', kind: 'toggle', onValue: 'ON', offValue: 'OFF' },
+      { key: 'ch3', label: 'Channel 3', kind: 'toggle', onValue: 'ON', offValue: 'OFF' },
+      { key: 'ch4', label: 'Channel 4', kind: 'toggle', onValue: 'ON', offValue: 'OFF' },
     ],
   },
 
@@ -174,31 +294,38 @@ export const DEVICE_TYPES: Record<string, DeviceTypeSpec> = {
     label: 'Fan',
     icon: 'sync-circle',
     category: 'climate',
+    component: 'fan',
     readings: [
-      POWER_READING,
-      { key: 'speed', label: 'Speed', kind: 'enum', values: ['low', 'medium', 'high'], primary: true },
-      { key: 'oscillate', label: 'Oscillating', kind: 'boolean' },
+      STATE_READING,
+      // The fan component speaks percentages; named speeds are preset modes.
+      { key: 'percentage', label: 'Speed', kind: 'number', unit: '%', min: 0, max: 100, aliases: ['speed'], primary: true },
+      { key: 'preset_mode', label: 'Preset', kind: 'enum', values: ['low', 'medium', 'high'] },
+      { key: 'oscillating', label: 'Oscillating', kind: 'boolean', aliases: ['oscillate'] },
     ],
     controls: [
-      POWER_CONTROL,
-      { key: 'speed', label: 'Speed', kind: 'enum', values: ['low', 'medium', 'high'] },
-      { key: 'oscillate', label: 'Oscillate', kind: 'toggle', onValue: true, offValue: false },
+      STATE_CONTROL,
+      { key: 'percentage', label: 'Speed', kind: 'stepper', min: 0, max: 100, step: 25, unit: '%', aliases: ['speed'] },
+      { key: 'preset_mode', label: 'Preset', kind: 'enum', values: ['low', 'medium', 'high'] },
+      { key: 'oscillating', label: 'Oscillate', kind: 'toggle', onValue: true, offValue: false, aliases: ['oscillate'] },
     ],
   },
   thermostat: {
     label: 'Thermostat',
     icon: 'thermometer',
     category: 'climate',
+    component: 'climate',
     readings: [
-      TEMP,
+      { ...TEMPERATURE, key: 'current_temperature', label: 'Temperature', aliases: ['temp', 'temperature'] },
       HUMIDITY,
-      { key: 'setpoint', label: 'Target', kind: 'number', unit: '°C', min: 5, max: 35, aliases: ['target'] },
+      // On a climate entity `temperature` is the target, and the measured value
+      // is `current_temperature`. Naming them the other way round is the single
+      // most common mistake when wiring one of these up.
+      { key: 'temperature', label: 'Target', kind: 'number', unit: '°C', min: 5, max: 35, deviceClass: 'temperature', aliases: ['setpoint', 'target'] },
       { key: 'mode', label: 'Mode', kind: 'enum', values: ['off', 'heat', 'cool', 'auto'] },
-      { key: 'heating', label: 'Heating', kind: 'boolean' },
+      { key: 'action', label: 'Action', kind: 'enum', values: ['off', 'heating', 'cooling', 'idle'], aliases: ['heating'] },
     ],
     controls: [
-      POWER_CONTROL,
-      { key: 'setpoint', label: 'Target', kind: 'stepper', min: 5, max: 35, step: 0.5, unit: '°C', aliases: ['target'] },
+      { key: 'temperature', label: 'Target', kind: 'stepper', min: 5, max: 35, step: 0.5, unit: '°C', aliases: ['setpoint', 'target'] },
       { key: 'mode', label: 'Mode', kind: 'enum', values: ['off', 'heat', 'cool', 'auto'] },
     ],
   },
@@ -206,40 +333,50 @@ export const DEVICE_TYPES: Record<string, DeviceTypeSpec> = {
     label: 'Air conditioner',
     icon: 'snow',
     category: 'climate',
+    component: 'climate',
     readings: [
-      POWER_READING,
-      TEMP,
-      { key: 'setpoint', label: 'Target', kind: 'number', unit: '°C', min: 16, max: 30 },
-      { key: 'mode', label: 'Mode', kind: 'enum', values: ['cool', 'heat', 'dry', 'fan', 'auto'] },
-      { key: 'fan', label: 'Fan speed', kind: 'enum', values: ['auto', 'low', 'medium', 'high'] },
+      STATE_READING,
+      { ...TEMPERATURE, key: 'current_temperature', label: 'Temperature', aliases: ['temp', 'temperature'] },
+      { key: 'temperature', label: 'Target', kind: 'number', unit: '°C', min: 16, max: 30, deviceClass: 'temperature', aliases: ['setpoint'] },
+      { key: 'mode', label: 'Mode', kind: 'enum', values: ['off', 'cool', 'heat', 'dry', 'fan_only', 'auto'] },
+      { key: 'fan_mode', label: 'Fan speed', kind: 'enum', values: ['auto', 'low', 'medium', 'high'], aliases: ['fan'] },
     ],
     controls: [
-      POWER_CONTROL,
-      { key: 'setpoint', label: 'Target', kind: 'stepper', min: 16, max: 30, step: 1, unit: '°C' },
-      { key: 'mode', label: 'Mode', kind: 'enum', values: ['cool', 'heat', 'dry', 'fan', 'auto'] },
-      { key: 'fan', label: 'Fan speed', kind: 'enum', values: ['auto', 'low', 'medium', 'high'] },
+      STATE_CONTROL,
+      { key: 'temperature', label: 'Target', kind: 'stepper', min: 16, max: 30, step: 1, unit: '°C', aliases: ['setpoint'] },
+      { key: 'mode', label: 'Mode', kind: 'enum', values: ['off', 'cool', 'heat', 'dry', 'fan_only', 'auto'] },
+      { key: 'fan_mode', label: 'Fan speed', kind: 'enum', values: ['auto', 'low', 'medium', 'high'], aliases: ['fan'] },
     ],
   },
   heater: {
     label: 'Heater',
     icon: 'flame',
     category: 'climate',
-    readings: [POWER_READING, TEMP, { key: 'setpoint', label: 'Target', kind: 'number', unit: '°C', min: 5, max: 35 }],
-    controls: [POWER_CONTROL, { key: 'setpoint', label: 'Target', kind: 'stepper', min: 5, max: 35, step: 1, unit: '°C' }],
+    component: 'climate',
+    readings: [
+      STATE_READING,
+      { ...TEMPERATURE, key: 'current_temperature', label: 'Temperature', aliases: ['temp', 'temperature'] },
+      { key: 'temperature', label: 'Target', kind: 'number', unit: '°C', min: 5, max: 35, deviceClass: 'temperature', aliases: ['setpoint'] },
+    ],
+    controls: [
+      STATE_CONTROL,
+      { key: 'temperature', label: 'Target', kind: 'stepper', min: 5, max: 35, step: 1, unit: '°C', aliases: ['setpoint'] },
+    ],
   },
   air_purifier: {
     label: 'Air purifier',
     icon: 'leaf',
     category: 'climate',
+    component: 'fan',
     readings: [
-      POWER_READING,
-      { key: 'pm25', label: 'PM2.5', kind: 'number', unit: 'µg/m³', primary: true },
+      STATE_READING,
+      { key: 'pm25', label: 'PM2.5', kind: 'number', unit: 'µg/m³', deviceClass: 'pm25', stateClass: 'measurement', primary: true },
       { key: 'filter_life', label: 'Filter life', kind: 'number', unit: '%', min: 0, max: 100 },
-      { key: 'speed', label: 'Speed', kind: 'enum', values: ['auto', 'low', 'medium', 'high'] },
+      { key: 'preset_mode', label: 'Speed', kind: 'enum', values: ['auto', 'low', 'medium', 'high'], aliases: ['speed'] },
     ],
     controls: [
-      POWER_CONTROL,
-      { key: 'speed', label: 'Speed', kind: 'enum', values: ['auto', 'low', 'medium', 'high'] },
+      STATE_CONTROL,
+      { key: 'preset_mode', label: 'Speed', kind: 'enum', values: ['auto', 'low', 'medium', 'high'], aliases: ['speed'] },
     ],
   },
 
@@ -248,11 +385,12 @@ export const DEVICE_TYPES: Record<string, DeviceTypeSpec> = {
     label: 'Water level sensor',
     icon: 'water',
     category: 'water',
+    component: 'sensor',
     readings: [
-      { key: 'level', label: 'Level', kind: 'number', unit: '%', min: 0, max: 100, primary: true },
+      { key: 'level', label: 'Level', kind: 'number', unit: '%', min: 0, max: 100, stateClass: 'measurement', primary: true },
       { key: 'full', label: 'Tank full', kind: 'boolean' },
       { key: 'empty', label: 'Tank empty', kind: 'boolean' },
-      { key: 'litres', label: 'Volume', kind: 'number', unit: 'L' },
+      { key: 'volume', label: 'Volume', kind: 'number', unit: 'L', deviceClass: 'volume_storage', aliases: ['litres'] },
       BATTERY,
     ],
     controls: [],
@@ -261,31 +399,38 @@ export const DEVICE_TYPES: Record<string, DeviceTypeSpec> = {
     label: 'Water pump / motor',
     icon: 'water-outline',
     category: 'water',
+    component: 'switch',
     readings: [
-      POWER_READING,
+      STATE_READING,
       { key: 'running', label: 'Running', kind: 'boolean' },
-      { key: 'runtime', label: 'Runtime', kind: 'number', unit: 's' },
-      { key: 'current', label: 'Current', kind: 'number', unit: 'A' },
+      { key: 'runtime', label: 'Runtime', kind: 'number', unit: 's', deviceClass: 'duration' },
+      CURRENT,
       { key: 'dry_run', label: 'Dry run fault', kind: 'boolean' },
     ],
-    controls: [POWER_CONTROL],
+    controls: [STATE_CONTROL],
   },
   valve: {
     label: 'Valve',
     icon: 'git-branch',
     category: 'water',
+    component: 'valve',
+    deviceClass: 'water',
     readings: [
-      { key: 'position', label: 'Position', kind: 'enum', values: ['open', 'closed'], primary: true },
-      { key: 'flow', label: 'Flow', kind: 'number', unit: 'L/min' },
+      { key: 'state', label: 'Position', kind: 'enum', values: ['open', 'closed', 'opening', 'closing'], aliases: ['position'], primary: true },
+      { key: 'flow', label: 'Flow', kind: 'number', unit: 'L/min', stateClass: 'measurement' },
     ],
-    controls: [{ key: 'position', label: 'Valve', kind: 'toggle', onValue: 'open', offValue: 'closed' }],
+    controls: [
+      { key: 'state', label: 'Valve', kind: 'toggle', onValue: 'OPEN', offValue: 'CLOSE', aliases: ['position'] },
+    ],
   },
   leak_sensor: {
     label: 'Leak sensor',
     icon: 'warning',
     category: 'water',
+    component: 'binary_sensor',
+    deviceClass: 'moisture',
     readings: [
-      { key: 'leak', label: 'Leak detected', kind: 'boolean', primary: true },
+      { key: 'state', label: 'Leak detected', kind: 'enum', values: ['ON', 'OFF'], aliases: ['leak', 'moisture'], primary: true },
       BATTERY,
     ],
     controls: [],
@@ -294,12 +439,13 @@ export const DEVICE_TYPES: Record<string, DeviceTypeSpec> = {
     label: 'Irrigation',
     icon: 'rainy',
     category: 'water',
+    component: 'switch',
     readings: [
-      POWER_READING,
+      STATE_READING,
       { key: 'zone', label: 'Zone', kind: 'number' },
-      { key: 'soil_moisture', label: 'Soil moisture', kind: 'number', unit: '%', min: 0, max: 100, primary: true },
+      { key: 'moisture', label: 'Soil moisture', kind: 'number', unit: '%', min: 0, max: 100, deviceClass: 'moisture', stateClass: 'measurement', aliases: ['soil_moisture'], primary: true },
     ],
-    controls: [POWER_CONTROL, { key: 'zone', label: 'Zone', kind: 'stepper', min: 1, max: 8, step: 1 }],
+    controls: [STATE_CONTROL, { key: 'zone', label: 'Zone', kind: 'stepper', min: 1, max: 8, step: 1 }],
   },
 
   // ── security ─────────────────────────────────────────────────────
@@ -307,19 +453,23 @@ export const DEVICE_TYPES: Record<string, DeviceTypeSpec> = {
     label: 'Lock',
     icon: 'lock-closed',
     category: 'security',
+    component: 'lock',
     readings: [
-      { key: 'lock', label: 'Locked', kind: 'enum', values: ['locked', 'unlocked'], primary: true },
-      { key: 'jammed', label: 'Jammed', kind: 'boolean' },
+      { key: 'state', label: 'Locked', kind: 'enum', values: ['LOCKED', 'UNLOCKED', 'JAMMED'], aliases: ['lock'], primary: true },
       BATTERY,
     ],
-    controls: [{ key: 'lock', label: 'Locked', kind: 'toggle', onValue: 'lock', offValue: 'unlock' }],
+    // payload_lock / payload_unlock on the lock component are LOCK and UNLOCK,
+    // which are the commands -- the state words are LOCKED / UNLOCKED.
+    controls: [{ key: 'state', label: 'Locked', kind: 'toggle', onValue: 'LOCK', offValue: 'UNLOCK', aliases: ['lock'] }],
   },
   door_sensor: {
     label: 'Door / window sensor',
     icon: 'log-in',
     category: 'security',
+    component: 'binary_sensor',
+    deviceClass: 'door',
     readings: [
-      { key: 'contact', label: 'State', kind: 'enum', values: ['open', 'closed'], aliases: ['door', 'window'], primary: true },
+      { key: 'state', label: 'State', kind: 'enum', values: ['ON', 'OFF'], aliases: ['contact', 'door', 'window'], primary: true },
       BATTERY,
     ],
     controls: [],
@@ -328,9 +478,11 @@ export const DEVICE_TYPES: Record<string, DeviceTypeSpec> = {
     label: 'Motion sensor',
     icon: 'walk',
     category: 'security',
+    component: 'binary_sensor',
+    deviceClass: 'motion',
     readings: [
-      { key: 'motion', label: 'Motion', kind: 'boolean', aliases: ['occupancy', 'pir'], primary: true },
-      { key: 'lux', label: 'Light level', kind: 'number', unit: 'lx' },
+      { key: 'state', label: 'Motion', kind: 'enum', values: ['ON', 'OFF'], aliases: ['motion', 'occupancy', 'pir'], primary: true },
+      { key: 'illuminance', label: 'Light level', kind: 'number', unit: 'lx', deviceClass: 'illuminance', stateClass: 'measurement', aliases: ['lux'] },
       BATTERY,
     ],
     controls: [],
@@ -339,34 +491,38 @@ export const DEVICE_TYPES: Record<string, DeviceTypeSpec> = {
     label: 'Camera',
     icon: 'videocam',
     category: 'security',
+    component: 'camera',
     readings: [
-      { key: 'recording', label: 'Recording', kind: 'boolean', primary: true },
-      { key: 'motion', label: 'Motion', kind: 'boolean' },
-      { key: 'night_vision', label: 'Night vision', kind: 'boolean' },
+      { key: 'recording', label: 'Recording', kind: 'enum', values: ['ON', 'OFF'], primary: true },
+      { key: 'motion', label: 'Motion', kind: 'enum', values: ['ON', 'OFF'] },
+      { key: 'night_vision', label: 'Night vision', kind: 'enum', values: ['ON', 'OFF'] },
     ],
     controls: [
-      { key: 'recording', label: 'Recording', kind: 'toggle', onValue: 'on', offValue: 'off' },
-      { key: 'night_vision', label: 'Night vision', kind: 'toggle', onValue: 'on', offValue: 'off' },
+      { key: 'recording', label: 'Recording', kind: 'toggle', onValue: 'ON', offValue: 'OFF' },
+      { key: 'night_vision', label: 'Night vision', kind: 'toggle', onValue: 'ON', offValue: 'OFF' },
     ],
   },
   siren: {
     label: 'Siren',
     icon: 'volume-high',
     category: 'security',
-    readings: [POWER_READING, { key: 'volume', label: 'Volume', kind: 'number', unit: '%', min: 0, max: 100 }],
+    component: 'siren',
+    readings: [STATE_READING, { key: 'volume_level', label: 'Volume', kind: 'number', min: 0, max: 100, unit: '%', aliases: ['volume'] }],
     controls: [
-      POWER_CONTROL,
-      { key: 'volume', label: 'Volume', kind: 'stepper', min: 0, max: 100, step: 10, unit: '%' },
+      STATE_CONTROL,
+      { key: 'volume_level', label: 'Volume', kind: 'stepper', min: 0, max: 100, step: 10, unit: '%', aliases: ['volume'] },
     ],
   },
   smoke_sensor: {
     label: 'Smoke / gas sensor',
     icon: 'cloud',
     category: 'security',
+    component: 'binary_sensor',
+    deviceClass: 'smoke',
     readings: [
-      { key: 'smoke', label: 'Smoke', kind: 'boolean', primary: true },
-      { key: 'gas', label: 'Gas', kind: 'boolean' },
-      { key: 'co', label: 'CO', kind: 'number', unit: 'ppm' },
+      { key: 'state', label: 'Smoke', kind: 'enum', values: ['ON', 'OFF'], aliases: ['smoke'], primary: true },
+      { key: 'gas', label: 'Gas', kind: 'enum', values: ['ON', 'OFF'] },
+      { key: 'carbon_monoxide', label: 'CO', kind: 'number', unit: 'ppm', deviceClass: 'carbon_monoxide', stateClass: 'measurement', aliases: ['co'] },
       BATTERY,
     ],
     controls: [],
@@ -375,15 +531,27 @@ export const DEVICE_TYPES: Record<string, DeviceTypeSpec> = {
     label: 'Garage door',
     icon: 'car',
     category: 'security',
-    readings: [{ key: 'door', label: 'Door', kind: 'enum', values: ['open', 'closed', 'opening', 'closing'], primary: true }],
-    controls: [{ key: 'door', label: 'Door', kind: 'toggle', onValue: 'open', offValue: 'close' }],
+    component: 'cover',
+    deviceClass: 'garage',
+    readings: [
+      { key: 'state', label: 'Door', kind: 'enum', values: ['open', 'closed', 'opening', 'closing'], aliases: ['door'], primary: true },
+    ],
+    controls: [{ key: 'state', label: 'Door', kind: 'toggle', onValue: 'OPEN', offValue: 'CLOSE', aliases: ['door'] }],
   },
   curtain: {
     label: 'Curtain / blind',
     icon: 'browsers',
     category: 'other',
-    readings: [{ key: 'position', label: 'Position', kind: 'number', unit: '%', min: 0, max: 100, primary: true }],
-    controls: [{ key: 'position', label: 'Position', kind: 'stepper', min: 0, max: 100, step: 10, unit: '%' }],
+    component: 'cover',
+    deviceClass: 'curtain',
+    readings: [
+      { key: 'state', label: 'State', kind: 'enum', values: ['open', 'closed', 'opening', 'closing'] },
+      { key: 'position', label: 'Position', kind: 'number', unit: '%', min: 0, max: 100, primary: true },
+    ],
+    controls: [
+      { key: 'position', label: 'Position', kind: 'stepper', min: 0, max: 100, step: 10, unit: '%' },
+      { key: 'state', label: 'Open', kind: 'toggle', onValue: 'OPEN', offValue: 'CLOSE' },
+    ],
   },
 
   // ── sensors ──────────────────────────────────────────────────────
@@ -391,25 +559,29 @@ export const DEVICE_TYPES: Record<string, DeviceTypeSpec> = {
     label: 'Sensor',
     icon: 'pulse',
     category: 'sensor',
-    readings: [TEMP, HUMIDITY, BATTERY, RSSI],
+    component: 'sensor',
+    readings: [TEMPERATURE, HUMIDITY, BATTERY, RSSI],
     controls: [],
   },
   temperature_sensor: {
     label: 'Temperature sensor',
     icon: 'thermometer-outline',
     category: 'sensor',
-    readings: [TEMP, HUMIDITY, BATTERY],
+    component: 'sensor',
+    deviceClass: 'temperature',
+    readings: [TEMPERATURE, HUMIDITY, BATTERY],
     controls: [],
   },
   air_quality: {
     label: 'Air quality',
     icon: 'cloudy',
     category: 'sensor',
+    component: 'sensor',
     readings: [
-      { key: 'co2', label: 'CO₂', kind: 'number', unit: 'ppm', primary: true },
-      { key: 'pm25', label: 'PM2.5', kind: 'number', unit: 'µg/m³' },
-      { key: 'voc', label: 'VOC', kind: 'number', unit: 'ppb' },
-      TEMP,
+      { key: 'carbon_dioxide', label: 'CO₂', kind: 'number', unit: 'ppm', deviceClass: 'carbon_dioxide', stateClass: 'measurement', aliases: ['co2'], primary: true },
+      { key: 'pm25', label: 'PM2.5', kind: 'number', unit: 'µg/m³', deviceClass: 'pm25', stateClass: 'measurement' },
+      { key: 'volatile_organic_compounds', label: 'VOC', kind: 'number', unit: 'ppb', deviceClass: 'volatile_organic_compounds', stateClass: 'measurement', aliases: ['voc'] },
+      TEMPERATURE,
       HUMIDITY,
     ],
     controls: [],
@@ -418,17 +590,23 @@ export const DEVICE_TYPES: Record<string, DeviceTypeSpec> = {
     label: 'Light sensor',
     icon: 'sunny',
     category: 'sensor',
-    readings: [{ key: 'lux', label: 'Illuminance', kind: 'number', unit: 'lx', primary: true }, BATTERY],
+    component: 'sensor',
+    deviceClass: 'illuminance',
+    readings: [
+      { key: 'illuminance', label: 'Illuminance', kind: 'number', unit: 'lx', deviceClass: 'illuminance', stateClass: 'measurement', aliases: ['lux'], primary: true },
+      BATTERY,
+    ],
     controls: [],
   },
   soil_sensor: {
     label: 'Soil sensor',
     icon: 'flower',
     category: 'sensor',
+    component: 'sensor',
     readings: [
-      { key: 'soil_moisture', label: 'Soil moisture', kind: 'number', unit: '%', min: 0, max: 100, primary: true },
-      { key: 'ph', label: 'pH', kind: 'number', min: 0, max: 14 },
-      TEMP,
+      { key: 'moisture', label: 'Soil moisture', kind: 'number', unit: '%', min: 0, max: 100, deviceClass: 'moisture', stateClass: 'measurement', aliases: ['soil_moisture'], primary: true },
+      { key: 'ph', label: 'pH', kind: 'number', min: 0, max: 14, deviceClass: 'ph' },
+      TEMPERATURE,
       BATTERY,
     ],
     controls: [],
@@ -437,7 +615,11 @@ export const DEVICE_TYPES: Record<string, DeviceTypeSpec> = {
     label: 'Weight / load cell',
     icon: 'barbell',
     category: 'sensor',
-    readings: [{ key: 'weight', label: 'Weight', kind: 'number', unit: 'kg', primary: true }],
+    component: 'sensor',
+    deviceClass: 'weight',
+    readings: [
+      { key: 'weight', label: 'Weight', kind: 'number', unit: 'kg', deviceClass: 'weight', stateClass: 'measurement', primary: true },
+    ],
     controls: [],
   },
 
@@ -446,23 +628,22 @@ export const DEVICE_TYPES: Record<string, DeviceTypeSpec> = {
     label: 'Energy meter',
     icon: 'speedometer',
     category: 'energy',
-    readings: [
-      { key: 'watts', label: 'Power', kind: 'number', unit: 'W', primary: true },
-      { key: 'energy', label: 'Energy', kind: 'number', unit: 'kWh' },
-      { key: 'voltage', label: 'Voltage', kind: 'number', unit: 'V' },
-      { key: 'current', label: 'Current', kind: 'number', unit: 'A' },
-    ],
+    component: 'sensor',
+    deviceClass: 'power',
+    readings: [WATTS, ENERGY, VOLTAGE, CURRENT],
     controls: [],
   },
   battery_bank: {
     label: 'Battery / inverter',
     icon: 'battery-charging',
     category: 'energy',
+    component: 'sensor',
+    deviceClass: 'battery',
     readings: [
-      { key: 'charge', label: 'Charge', kind: 'number', unit: '%', min: 0, max: 100, primary: true },
-      { key: 'voltage', label: 'Voltage', kind: 'number', unit: 'V' },
-      { key: 'charging', label: 'Charging', kind: 'boolean' },
-      { key: 'load', label: 'Load', kind: 'number', unit: 'W' },
+      { ...BATTERY, label: 'Charge', aliases: ['charge'], primary: true },
+      VOLTAGE,
+      { key: 'charging', label: 'Charging', kind: 'enum', values: ['ON', 'OFF'] },
+      { ...WATTS, label: 'Load', aliases: ['load', 'watts'], primary: false },
     ],
     controls: [],
   },
@@ -470,10 +651,12 @@ export const DEVICE_TYPES: Record<string, DeviceTypeSpec> = {
     label: 'Solar inverter',
     icon: 'sunny-outline',
     category: 'energy',
+    component: 'sensor',
+    deviceClass: 'power',
     readings: [
-      { key: 'watts', label: 'Generating', kind: 'number', unit: 'W', primary: true },
-      { key: 'energy_today', label: 'Today', kind: 'number', unit: 'kWh' },
-      { key: 'voltage', label: 'Voltage', kind: 'number', unit: 'V' },
+      { ...WATTS, label: 'Generating' },
+      { ...ENERGY, key: 'energy_today', label: 'Today', stateClass: 'total' },
+      VOLTAGE,
     ],
     controls: [],
   },
@@ -483,6 +666,7 @@ export const DEVICE_TYPES: Record<string, DeviceTypeSpec> = {
     label: 'Gateway',
     icon: 'wifi',
     category: 'other',
+    component: 'sensor',
     readings: [{ key: 'clients', label: 'Clients', kind: 'number', primary: true }, UPTIME, RSSI],
     controls: [],
   },
@@ -490,6 +674,7 @@ export const DEVICE_TYPES: Record<string, DeviceTypeSpec> = {
     label: 'Generic device',
     icon: 'hardware-chip',
     category: 'other',
+    component: 'sensor',
     readings: [],
     controls: [],
   },
@@ -529,6 +714,7 @@ const TYPE_ALIASES: Record<string, string> = {
   gas: 'smoke_sensor',
   blind: 'curtain',
   shade: 'curtain',
+  cover: 'curtain',
   ldr: 'light_sensor',
   lux: 'light_sensor',
   soil: 'soil_sensor',
@@ -536,6 +722,7 @@ const TYPE_ALIASES: Record<string, string> = {
   inverter: 'battery_bank',
   broker: 'gateway',
   router: 'gateway',
+  binary_sensor: 'motion_sensor',
 };
 
 export function normalizeType(type: string | null | undefined): string {
@@ -569,28 +756,57 @@ export function controlKeysFor(type: string): string[] {
   return [...keys];
 }
 
+/**
+ * Canonical name for a key a device published, so `temp`, `lux` and the old
+ * `power` land on the same reading as `temperature`, `illuminance` and
+ * `state`. Unknown keys pass through untouched.
+ */
+export function canonicalKey(type: string | null | undefined, key: string): string {
+  const spec = getType(type);
+  const lower = key.toLowerCase();
+
+  // Exact matches first, across every reading and control, before any alias is
+  // considered. One name can be both: on a plug, `power` is the watts reading
+  // *and* the old name for `state`. Alias-first would fold the watts onto the
+  // on/off value and each would destroy the other.
+  for (const reading of spec.readings) {
+    if (reading.key === lower) return reading.key;
+  }
+  for (const control of spec.controls) {
+    if (control.key === lower) return control.key;
+  }
+
+  for (const reading of spec.readings) {
+    if (reading.aliases?.includes(lower)) return reading.key;
+  }
+  for (const control of spec.controls) {
+    if (control.aliases?.includes(lower)) return control.key;
+  }
+  return key;
+}
+
 /** Best-effort type guess from the reading keys a device publishes. */
 export function guessType(readingKeys: string[]): string {
   const keys = new Set(readingKeys.map((key) => key.split('.').pop()!.toLowerCase()));
   const has = (...names: string[]) => names.some((name) => keys.has(name));
 
-  if (has('leak')) return 'leak_sensor';
+  if (has('leak', 'moisture') && !has('soil_moisture')) return 'leak_sensor';
   if (has('level', 'full', 'empty') && !has('brightness')) return 'water_level';
-  if (has('dry_run', 'running') && has('power')) return 'motor';
-  if (has('smoke', 'co')) return 'smoke_sensor';
+  if (has('dry_run', 'running')) return 'motor';
+  if (has('smoke', 'co', 'carbon_monoxide')) return 'smoke_sensor';
   if (has('motion', 'occupancy', 'pir')) return 'motion_sensor';
   if (has('contact', 'door') && !has('position')) return 'door_sensor';
   if (has('lock', 'jammed')) return 'lock';
   if (has('soil_moisture', 'ph')) return 'soil_sensor';
-  if (has('co2', 'voc')) return 'air_quality';
+  if (has('co2', 'carbon_dioxide', 'voc', 'volatile_organic_compounds')) return 'air_quality';
   if (has('charge', 'charging')) return 'battery_bank';
-  if (has('energy', 'watts') && !has('power')) return 'energy_meter';
-  if (has('brightness', 'dim')) return 'light';
-  if (has('setpoint', 'target')) return 'thermostat';
-  if (has('speed') && has('power')) return 'fan';
+  if (has('energy', 'watts') && !has('state', 'power')) return 'energy_meter';
+  if (has('brightness', 'dim', 'color_temp')) return 'light';
+  if (has('setpoint', 'target', 'current_temperature')) return 'thermostat';
+  if (has('percentage', 'speed') && has('state')) return 'fan';
   if (has('watts', 'current')) return 'plug';
-  if (has('lux')) return 'light_sensor';
+  if (has('lux', 'illuminance')) return 'light_sensor';
   if (has('temp', 'temperature', 'humidity')) return 'sensor';
-  if (has('power', 'state')) return 'switch';
+  if (has('state', 'power', 'switch', 'relay')) return 'switch';
   return 'generic';
 }

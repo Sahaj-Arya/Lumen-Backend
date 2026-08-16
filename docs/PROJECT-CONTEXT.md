@@ -108,26 +108,46 @@ homes ──< automations ──< automation_watches  (which devices a rule read
 - Migrations `001`–`006`, forward-only, applied automatically at boot under an
   advisory lock.
 
-### MQTT topic conventions (backend, broker scripts and firmware all agree)
+### MQTT topic conventions (Home Assistant's, not house rules)
+
+The layout and the vocabulary come from the Home Assistant MQTT integration —
+the same one Tasmota, ESPHome, Zigbee2MQTT and Shelly speak — so third-party
+firmware works against this backend and third-party hubs work against these
+devices, both without a translation layer.
 
 ```
-devices/<uid>/status      retained + LWT   "online" / "offline"
-devices/<uid>/state       retained         presence word, or {"power":true,…}
-devices/<uid>/meta        retained         {"type":…,"capabilities":{…}}
-devices/<uid>/telemetry                    {"temp":23.5,"humidity":61}
-devices/<uid>/cmd         backend→device   {"power":"on"}  QoS 1, never retained
-devices/<uid>/<key>       retained         a single scalar reading
+devices/<uid>/availability  retained + LWT   "online" / "offline"
+devices/<uid>/state         retained         {"state":"ON","brightness":128}
+devices/<uid>/set           backend→device   {"state":"OFF"}  QoS 1, never retained
+devices/<uid>/telemetry                      {"temperature":23.5,"humidity":61}
+devices/<uid>/attributes    retained         extra json_attributes
+devices/<uid>/<key>         retained         a single scalar reading
+
+homeassistant/<component>/<uid>/config       retained, published by the device
 ```
+
+Values follow the same source: `state` is `"ON"`/`"OFF"`, `brightness` 0-255,
+`position` 0-100, `power` is watts, `energy` is kWh, sensors carry a
+`device_class`.
 
 Ingest rules that matter:
 
+- **Devices announce themselves** on the discovery prefix. The backend reads
+  the component and device_class out of that retained config to learn the type
+  and capabilities; it fills an unset type but never overwrites the owner's.
+  The device is the publisher, so exactly one writer owns that retained topic
+  and an unclaimed device is still discoverable.
+- **The pre-standard names still parse.** `status`, `meta` and `cmd` fold onto
+  `availability`, `attributes` and `command`; reading keys `temp`, `lux` and
+  the old `power` on/off fold onto `temperature`, `illuminance` and `state`
+  via `canonicalKey`. Firmware in the field keeps working.
 - **Retained messages are not history.** They are the broker replaying what it
   already held, so they update current state but are never appended to
   `device_readings` — otherwise every reconnect fabricates a data point.
-- **Presence follows the Last Will.** An explicit `status` topic wins; otherwise
-  inferred from live traffic, going `stale` after `DEVICE_STALE_SECONDS`.
+- **Presence follows the Last Will.** An explicit availability topic wins;
+  otherwise inferred from live traffic, going `stale` after `DEVICE_STALE_SECONDS`.
 - **An empty retained payload clears the value**, per MQTT convention.
-- A `status` payload that is *not* a presence word (`"on"`) is kept as a
+- An availability payload that is *not* a presence word (`"ON"`) is kept as a
   **reading** rather than discarded.
 
 ---
@@ -269,7 +289,7 @@ tests that need runtime values all build first.
 
 - **An automation firing from a device message.** Every path around it is
   proven, but the ingest→rule→publish loop has not run, because the `app`
-  principal's ACL only permits `devices/+/cmd` — it cannot publish a fake tank
+  principal's ACL only permits `devices/+/set` — it cannot publish a fake tank
   reading. Closing this needs a device principal:
   `node tools/simulate-device.mjs --id tank-01 --password '<pw>' --type sensor`
 - **The app rendering.** No simulator available here. It bundles clean (888

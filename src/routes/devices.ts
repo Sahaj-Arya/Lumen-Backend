@@ -6,7 +6,8 @@ import { audit } from '../services/audit.js';
 import { config } from '../config.js';
 import { currentUser, requireAuth, requireDeviceAccess, requireHomeRole } from '../auth/guard.js';
 import { generateSecret, hashPassword } from '../auth/password.js';
-import { listUnclaimed, publishCommand, readCachedState } from '../mqtt/bridge.js';
+import { listUnclaimed, publishCommand, readCachedState, readDiscovered } from '../mqtt/bridge.js';
+import { topics } from '../mqtt/topics.js';
 import { query, queryOne } from '../db/index.js';
 
 /**
@@ -47,7 +48,8 @@ const updateBody = z.object({
 });
 
 const commandBody = z.object({
-  // A command is a patch of key -> value, e.g. {"power":"on","brightness":60}.
+  // A command is a patch of key -> value, e.g. {"state":"ON","brightness":128}
+  // -- Home Assistant's light JSON schema, which is what devices expect.
   patch: z.record(z.union([z.string(), z.number(), z.boolean()])).refine(
     (patch) => Object.keys(patch).length > 0,
     'Command patch cannot be empty',
@@ -161,23 +163,36 @@ export async function deviceRoutes(app: FastifyInstance): Promise<void> {
       if (!group) throw ApiError.badRequest('Group does not belong to this home');
     }
 
+    // What the device announced about itself before anyone claimed it. Its
+    // retained discovery config was consumed while no device row existed, so
+    // without this the claim would drop the type and capabilities on the floor.
+    const discovered = await readDiscovered(body.deviceUid);
+    const type = body.type === 'generic' && discovered.type ? discovered.type : body.type;
+    // Only take a field the device sent as a plain string; anything else is
+    // firmware sending something unexpected, not a manufacturer name.
+    const announced = (key: string): string => {
+      const value = discovered.capabilities?.[key];
+      return typeof value === 'string' ? value : '';
+    };
+
     // Credential for the device's own broker principal. Returned once, stored
     // only as a scrypt hash, in the format the broker's users.json expects.
     const mqttPassword = generateSecret(18);
     const row = await queryOne<DeviceRow>(
       `INSERT INTO devices (home_id, group_id, device_uid, name, type, manufacturer, model, notes,
-                            mqtt_password_hash, credential_issued_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, now())
+                            capabilities, mqtt_password_hash, credential_issued_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10, now())
        RETURNING *`,
       [
         homeId,
         body.groupId ?? null,
         body.deviceUid,
-        body.name ?? body.deviceUid,
-        body.type,
-        body.manufacturer ?? '',
-        body.model ?? '',
+        body.name ?? discovered.name ?? body.deviceUid,
+        type,
+        body.manufacturer ?? announced('manufacturer'),
+        body.model ?? announced('model'),
         body.notes ?? '',
+        discovered.capabilities ? JSON.stringify(discovered.capabilities) : null,
         await hashPassword(mqttPassword),
       ],
     );
@@ -347,7 +362,7 @@ export async function deviceRoutes(app: FastifyInstance): Promise<void> {
           deviceId,
           user.id,
           JSON.stringify(body.patch),
-          `${config.MQTT_BASE_TOPIC}/${access.deviceUid}/cmd`,
+          topics.command(config.MQTT_BASE_TOPIC, access.deviceUid),
           (error as Error).message,
         ],
       );

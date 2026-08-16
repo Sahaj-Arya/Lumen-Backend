@@ -14,6 +14,16 @@ import {
   topics,
   type ReadingValue,
 } from './topics.js';
+import {
+  DISCOVERY_PREFIX,
+  capabilitiesFromDiscovery,
+  declaredType,
+  parseDiscoveryTopic,
+  typeFromDiscovery,
+  uidFromDiscovery,
+  type DiscoveryConfig,
+} from './discovery.js';
+import { DEVICE_TYPES, canonicalKey, normalizeType } from '../model/deviceTypes.js';
 
 /**
  * The single MQTT client for the whole platform.
@@ -69,7 +79,10 @@ export async function startBridge(): Promise<void> {
     connected = true;
     reportedDown = false;
     logger.info({ url: config.MQTT_URL }, 'mqtt bridge connected');
-    client!.subscribe(topics.all(config.MQTT_BASE_TOPIC), { qos: 1 }, (error, granted) => {
+    // Device data, plus the discovery prefix every hub in the ecosystem
+    // listens on — that is where a device says what it is.
+    const wanted = [topics.all(config.MQTT_BASE_TOPIC), `${DISCOVERY_PREFIX}/#`];
+    client!.subscribe(wanted, { qos: 1 }, (error, granted) => {
       if (error) {
         logger.error({ err: error }, 'mqtt subscribe failed');
         return;
@@ -142,6 +155,7 @@ export async function publishCommand(
 interface DeviceRow {
   id: string;
   status: string;
+  type: string;
 }
 
 /**
@@ -150,21 +164,104 @@ interface DeviceRow {
  * being persisted the moment someone claims them.
  */
 async function lookupDevice(deviceUid: string): Promise<DeviceRow | null> {
-  return queryOne<DeviceRow>('SELECT id, status FROM devices WHERE device_uid = $1', [deviceUid]);
+  return queryOne<DeviceRow>('SELECT id, status, type FROM devices WHERE device_uid = $1', [
+    deviceUid,
+  ]);
+}
+
+/**
+ * Folds the names firmware uses onto the catalogue's own: `temp` becomes
+ * `temperature`, `lux` becomes `illuminance`, and this platform's old `power`
+ * on/off becomes `state`. Done on ingest so one device reporting `temp` and
+ * another reporting `temperature` land on the same key, and an automation
+ * written against one works with both.
+ */
+function canonicalizeReadings(
+  type: string | null,
+  readings: Record<string, ReadingValue>,
+): Record<string, ReadingValue> {
+  if (!type) return readings;
+  const out: Record<string, ReadingValue> = {};
+  for (const [key, value] of Object.entries(readings)) {
+    out[canonicalKey(type, key)] = value;
+  }
+  return out;
+}
+
+/**
+ * A device announcing itself on the discovery prefix. The type and
+ * capabilities it declares are recorded against the device once it exists;
+ * before that the announcement is only useful as proof of life, which the
+ * device's own state topics already provide.
+ */
+async function handleDiscovery(topic: string, payload: string): Promise<void> {
+  const parsed = parseDiscoveryTopic(topic);
+  if (!parsed) return;
+
+  if (payload.trim() === '') {
+    logger.info({ topic }, 'device withdrew its discovery config');
+    return;
+  }
+
+  let config: DiscoveryConfig;
+  try {
+    config = JSON.parse(payload) as DiscoveryConfig;
+  } catch {
+    logger.warn({ topic }, 'discovery config is not valid JSON');
+    return;
+  }
+
+  const deviceUid = uidFromDiscovery(parsed, config);
+  // A type the firmware names outright wins, as long as this catalogue has it;
+  // otherwise infer one from the component and device_class.
+  const declared = declaredType(config);
+  const named = declared ? normalizeType(declared) : null;
+  const type =
+    named && Object.hasOwn(DEVICE_TYPES, named)
+      ? named
+      : typeFromDiscovery(parsed.component, config);
+  const capabilities = capabilitiesFromDiscovery(parsed.component, config);
+
+  // Cached whether or not the device is claimed, so the Add device screen can
+  // show what an unclaimed device says it is.
+  await redis.hset(keys.deviceState(deviceUid), {
+    discoveredType: type,
+    discoveredName: String(config.name ?? config.device?.name ?? ''),
+    capabilities: JSON.stringify(capabilities),
+  });
+
+  const device = await lookupDevice(deviceUid);
+  if (!device) return;
+
+  // The type is only filled in, never overwritten: whatever the owner chose in
+  // the app outranks what the firmware guesses about itself.
+  await query(
+    `UPDATE devices
+        SET capabilities = $2::jsonb,
+            type = CASE WHEN type IS NULL OR type = 'generic' THEN $3 ELSE type END
+      WHERE id = $1`,
+    [device.id, JSON.stringify(capabilities), type],
+  );
+  logger.info({ deviceUid, component: parsed.component, type }, 'device discovered');
 }
 
 async function handleMessage(topic: string, payload: string, retained: boolean): Promise<void> {
   if (topic.startsWith('$SYS/')) return;
 
+  if (topic.startsWith(`${DISCOVERY_PREFIX}/`)) {
+    await handleDiscovery(topic, payload);
+    return;
+  }
+
   const parsed = parseDeviceTopic(topic, config.MQTT_BASE_TOPIC);
-  if (!parsed || parsed.kind === 'cmd') return; // our own commands echo back
+  if (!parsed || parsed.kind === 'command') return; // our own commands echo back
 
   const at = Date.now();
   const update: DeviceUpdate = { deviceUid: parsed.deviceUid, at };
   const readings: Record<string, ReadingValue> = {};
 
   switch (parsed.kind) {
-    case 'status': {
+    case 'availability': {
       const status = parseStatusPayload(payload);
       if (status) update.status = status;
       else if (payload.trim() !== '' && parsed.key) {
@@ -184,10 +281,10 @@ async function handleMessage(topic: string, payload: string, retained: boolean):
       }
       break;
     }
-    case 'meta': {
-      const meta = parseReadingPayload(payload);
-      if (meta && typeof meta === 'object' && !Array.isArray(meta)) {
-        await persistMeta(parsed.deviceUid, meta as Record<string, unknown>);
+    case 'attributes': {
+      const attributes = parseReadingPayload(payload);
+      if (attributes && typeof attributes === 'object' && !Array.isArray(attributes)) {
+        await persistMeta(parsed.deviceUid, attributes as Record<string, unknown>);
       }
       break;
     }
@@ -213,12 +310,14 @@ async function handleMessage(topic: string, payload: string, retained: boolean):
     }
   }
 
-  if (Object.keys(readings).length > 0) update.readings = readings;
+  const device = await lookupDevice(parsed.deviceUid);
+
+  const named = canonicalizeReadings(device?.type ?? null, readings);
+  if (Object.keys(named).length > 0) update.readings = named;
   if (!update.status && !update.readings) return;
 
   await cacheState(update, retained);
 
-  const device = await lookupDevice(parsed.deviceUid);
   if (device) {
     // Snapshot before the write, so a rule using `changed` can see what the
     // value actually changed from.
@@ -350,6 +449,36 @@ async function clearReading(deviceUid: string, key: string): Promise<void> {
 }
 
 /** Latest cached state for a device, as the API returns it. */
+/**
+ * What a device said about itself on the discovery prefix, cached from before
+ * it was claimed. A retained config is delivered once per subscription, so by
+ * the time a device row exists the announcement is long consumed — this is how
+ * a freshly claimed device still arrives with its type and capabilities.
+ */
+export async function readDiscovered(deviceUid: string): Promise<{
+  type: string | null;
+  name: string | null;
+  capabilities: Record<string, unknown> | null;
+}> {
+  const raw = await redis.hmget(
+    keys.deviceState(deviceUid),
+    'discoveredType',
+    'discoveredName',
+    'capabilities',
+  );
+  const [type, name, capabilities] = raw;
+
+  let parsed: Record<string, unknown> | null = null;
+  if (capabilities) {
+    try {
+      parsed = JSON.parse(capabilities) as Record<string, unknown>;
+    } catch {
+      parsed = null;
+    }
+  }
+  return { type: type || null, name: name || null, capabilities: parsed };
+}
+
 export async function readCachedState(deviceUid: string): Promise<{
   status: string | null;
   lastSeenAt: number | null;

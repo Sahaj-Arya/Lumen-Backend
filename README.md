@@ -161,7 +161,7 @@ at least one owner.
 | PATCH | `/:id` | rename, retype, regroup, favourite |
 | DELETE | `/:id` | unclaim (the hardware keeps publishing) |
 | POST | `/:id/credentials` | rotate the device's MQTT password |
-| POST | `/:id/commands` | `{"patch":{"power":"on"}}` → publishes to `devices/<uid>/cmd` |
+| POST | `/:id/commands` | `{"patch":{"state":"ON"}}` → publishes to `devices/<uid>/set` |
 | GET | `/:id/commands` | audit trail of commands sent |
 
 ### Automations — `/api/automations`
@@ -189,10 +189,10 @@ A rule is `trigger` + optional `conditions` + ordered `actions`:
     "clearValue": 80           // hysteresis: re-arms only below 80
   },
   "conditions": [              // all must hold when the trigger fires
-    { "deviceId": "<pump>", "key": "power", "op": "==", "value": "on" }
+    { "deviceId": "<pump>", "key": "state", "op": "==", "value": "ON" }
   ],
   "actions": [
-    { "kind": "command", "deviceId": "<pump>", "patch": { "power": "off" } }
+    { "kind": "command", "deviceId": "<pump>", "patch": { "state": "OFF" } }
   ],
   "cooldownSeconds": 30,
   "edgeTriggered": true
@@ -266,28 +266,46 @@ the bridge is down.
 
 ## Topic model
 
-Identical to the app and the broker's own scripts, so all three agree:
+Home Assistant's MQTT conventions, not house rules — the same layout Tasmota,
+ESPHome and Zigbee2MQTT speak, so third-party firmware and third-party hubs both
+work against this broker unmodified. The app and the broker's scripts follow it
+too:
 
 ```
-devices/<uid>/status      retained + LWT   "online" / "offline"
-devices/<uid>/state       retained         presence word, or {"power":true,…}
-devices/<uid>/meta        retained         {"type":…,"capabilities":{…}}
-devices/<uid>/telemetry                    {"temp":23.5,"humidity":61}
-devices/<uid>/cmd         backend→device   {"power":"on"}  QoS 1, never retained
-devices/<uid>/<key>       retained         a single scalar reading
+devices/<uid>/availability  retained + LWT   "online" / "offline"
+devices/<uid>/state         retained         {"state":"ON","brightness":128}
+devices/<uid>/set           backend→device   {"state":"OFF"}  QoS 1, never retained
+devices/<uid>/telemetry                      {"temperature":23.5,"humidity":61}
+devices/<uid>/attributes    retained         extra json_attributes
+devices/<uid>/<key>         retained         a single scalar reading
+
+homeassistant/<component>/<uid>/config       retained, published by the device
 ```
+
+Vocabulary follows the same source: `state` is `"ON"`/`"OFF"`, `brightness` is
+0-255, `position` is 0-100, `power` means watts and `energy` kWh, and sensors
+carry a `device_class`. See `src/model/deviceTypes.ts`.
 
 Ingest rules that matter:
 
+- **Devices announce themselves.** A retained config on the discovery prefix
+  tells the backend a device's component, device class and topics; the type it
+  implies fills an unset `type` but never overwrites the owner's choice. The
+  device publishes it, not the backend — one retained publisher per topic, and
+  it works before anyone claims the device.
+- **Old names still parse.** `status`, `meta` and `cmd` map onto
+  `availability`, `attributes` and `command`, and firmware reporting `temp`,
+  `lux` or `power: "on"` is folded onto `temperature`, `illuminance` and
+  `state` by `canonicalKey`. Nothing in the field breaks.
 - **Retained messages are not history.** They are the broker replaying what it
   already held, so they update current state but are never appended to
   `device_readings` — otherwise every reconnect fabricates a data point.
-- **Presence follows the Last Will.** An explicit `status` topic wins; otherwise
-  presence is inferred from live traffic and goes `stale` after
+- **Presence follows the Last Will.** An explicit availability topic wins;
+  otherwise presence is inferred from live traffic and goes `stale` after
   `DEVICE_STALE_SECONDS`.
 - **An empty retained payload clears the value**, per MQTT convention.
-- A `status` payload that is not a presence word (`"on"`) is kept as a *reading*
-  rather than discarded.
+- An availability payload that is not a presence word (`"ON"`) is kept as a
+  *reading* rather than discarded.
 
 ## Device provisioning
 
