@@ -3,7 +3,7 @@ import { z } from 'zod';
 
 import { ApiError } from '../errors.js';
 import { audit } from '../services/audit.js';
-import { automationSchema, type AutomationRow } from '../automation/types.js';
+import { automationSchema, isFiring, type AutomationRow } from '../automation/types.js';
 import { currentUser, requireAuth, requireHomeRole } from '../auth/guard.js';
 import { query, queryOne, transaction } from '../db/index.js';
 import { runNow } from '../automation/engine.js';
@@ -15,7 +15,7 @@ const present = (row: AutomationRow & { run_count?: number; description?: string
   name: row.name,
   description: row.description ?? '',
   enabled: row.enabled,
-  trigger: row.trigger,
+  match: row.match,
   conditions: row.conditions,
   actions: row.actions,
   cooldownSeconds: row.cooldown_seconds,
@@ -25,20 +25,51 @@ const present = (row: AutomationRow & { run_count?: number; description?: string
 });
 
 /**
- * Every device a rule references must belong to the rule's home. Without this
- * a member of one home could name a device id from another and drive it.
+ * Every device a rule references must be one the author can actually reach —
+ * scoped to the account, not to a single home.
+ *
+ * Home scoping was too narrow: someone with a house and a workshop could not
+ * write 'if the workshop tank is full, stop the house pump', and a one-device
+ * rule was awkward because the editor had to stay inside whichever home it
+ * happened to pick first. Membership is still the boundary; it is just checked
+ * across every home the user belongs to.
  */
-async function assertDevicesInHome(homeId: string, deviceIds: string[]): Promise<void> {
+async function assertDevicesAccessible(userId: string, deviceIds: string[]): Promise<void> {
   if (deviceIds.length === 0) return;
   const rows = await query<{ id: string }>(
-    'SELECT id FROM devices WHERE home_id = $1 AND id = ANY($2::uuid[])',
-    [homeId, deviceIds],
+    `SELECT d.id FROM devices d
+       JOIN home_members m ON m.home_id = d.home_id AND m.user_id = $1
+      WHERE d.id = ANY($2::uuid[])`,
+    [userId, deviceIds],
   );
   const found = new Set(rows.rows.map((row) => row.id));
   const missing = deviceIds.filter((id) => !found.has(id));
   if (missing.length > 0) {
-    throw ApiError.badRequest('Some referenced devices are not in this home', { missing });
+    throw ApiError.badRequest('Some referenced devices are not in your account', { missing });
   }
+}
+
+/**
+ * A rule still belongs to one home for listing and grouping. It is taken from
+ * the trigger device so the caller does not have to pick, and a rule spanning
+ * homes files under the one that sets it off.
+ */
+async function homeForRule(
+  input: { conditions: AutomationRow['conditions']; actions: AutomationRow['actions'] },
+  fallback: string,
+): Promise<string> {
+  const named = input.conditions.find(
+    (condition) => condition.kind === 'device' || condition.kind === 'status',
+  );
+  const anchor =
+    named && 'deviceId' in named
+      ? named.deviceId
+      : input.actions.find((action) => action.kind === 'command')?.deviceId;
+  if (!anchor) return fallback;
+  const row = await queryOne<{ home_id: string }>('SELECT home_id FROM devices WHERE id = $1', [
+    anchor,
+  ]);
+  return row?.home_id ?? fallback;
 }
 
 /**
@@ -50,12 +81,32 @@ function assertOwner(row: { owner_id?: string | null }, userId: string): void {
   if (row.owner_id !== userId) throw ApiError.notFound('Automation not found');
 }
 
-function allDeviceIds(input: z.infer<typeof automationSchema>): string[] {
-  const ids = new Set(watchedDeviceIds(input.trigger, input.conditions));
+function allDeviceIds(input: {
+  conditions: AutomationRow['conditions'];
+  actions: AutomationRow['actions'];
+}): string[] {
+  const ids = new Set(watchedDeviceIds(input.conditions));
   for (const action of input.actions) {
     if (action.kind === 'command') ids.add(action.deviceId);
   }
   return [...ids];
+}
+
+/**
+ * Patch shape. `automationSchema` carries a refine (a rule needs something that
+ * can set it off), and a ZodEffects has no `.partial()`, so the base object is
+ * partialised here and the same invariant re-checked below when conditions are
+ * actually supplied.
+ */
+const automationPatchSchema = automationSchema.innerType().partial();
+
+function assertHasFiringCondition(conditions: AutomationRow['conditions']): void {
+  if (!conditions.some(isFiring)) {
+    throw ApiError.badRequest(
+      'A rule needs at least one condition that can set it off — a device reading, a device ' +
+        'going online or offline, or a time of day. A time window only narrows when a rule may run.',
+    );
+  }
 }
 
 export async function automationRoutes(app: FastifyInstance): Promise<void> {
@@ -82,26 +133,28 @@ export async function automationRoutes(app: FastifyInstance): Promise<void> {
     const { homeId } = z.object({ homeId: z.string().uuid() }).parse(request.query);
     const body = automationSchema.parse(request.body);
     await requireHomeRole(user.id, homeId, 'member');
-    await assertDevicesInHome(homeId, allDeviceIds(body));
+    await assertDevicesAccessible(user.id, allDeviceIds(body));
+    const ruleHome = await homeForRule(body, homeId);
+    await requireHomeRole(user.id, ruleHome, 'member');
 
-    // A schedule fires on a minute boundary, so a sub-minute cooldown would let
-    // two ticks in the same minute double-fire it.
-    const cooldown =
-      body.trigger.kind === 'schedule' ? Math.max(body.cooldownSeconds, 61) : body.cooldownSeconds;
+    // A schedule lands on a minute boundary, so a sub-minute cooldown would let
+    // two ticks in the same minute double-fire the rule.
+    const hasSchedule = body.conditions.some((condition) => condition.kind === 'schedule');
+    const cooldown = hasSchedule ? Math.max(body.cooldownSeconds, 61) : body.cooldownSeconds;
 
     const row = await transaction(async (client) => {
       const inserted = await client.query<AutomationRow>(
         `INSERT INTO automations
-           (home_id, name, description, enabled, trigger, conditions, actions,
+           (home_id, name, description, enabled, match, conditions, actions,
             cooldown_seconds, edge_triggered, created_by, owner_id)
-         VALUES ($1,$2,$3,$4,$5::jsonb,$6::jsonb,$7::jsonb,$8,$9,$10,$10)
+         VALUES ($1,$2,$3,$4,$5,$6::jsonb,$7::jsonb,$8,$9,$10,$10)
          RETURNING *`,
         [
-          homeId,
+          ruleHome,
           body.name,
           body.description,
           body.enabled,
-          JSON.stringify(body.trigger),
+          body.match,
           JSON.stringify(body.conditions),
           JSON.stringify(body.actions),
           cooldown,
@@ -111,7 +164,7 @@ export async function automationRoutes(app: FastifyInstance): Promise<void> {
       );
       const automation = inserted.rows[0]!;
 
-      for (const deviceId of watchedDeviceIds(body.trigger, body.conditions)) {
+      for (const deviceId of watchedDeviceIds(body.conditions)) {
         await client.query(
           'INSERT INTO automation_watches (automation_id, device_id) VALUES ($1, $2)',
           [automation.id, deviceId],
@@ -120,7 +173,7 @@ export async function automationRoutes(app: FastifyInstance): Promise<void> {
       return automation;
     });
 
-    await audit({ userId: user.id, homeId, action: 'automation.create', subject: body.name });
+    await audit({ userId: user.id, homeId: ruleHome, action: 'automation.create', subject: body.name });
     return reply.status(201).send(present(row));
   });
 
@@ -140,7 +193,7 @@ export async function automationRoutes(app: FastifyInstance): Promise<void> {
   app.patch('/:automationId', async (request) => {
     const user = currentUser(request);
     const { automationId } = z.object({ automationId: z.string().uuid() }).parse(request.params);
-    const body = automationSchema.partial().parse(request.body);
+    const body = automationPatchSchema.parse(request.body);
 
     const existing = await queryOne<AutomationRow>('SELECT * FROM automations WHERE id = $1', [
       automationId,
@@ -150,19 +203,11 @@ export async function automationRoutes(app: FastifyInstance): Promise<void> {
     await requireHomeRole(user.id, existing.home_id, 'member');
 
     const merged = {
-      ...existing,
-      trigger: body.trigger ?? existing.trigger,
       conditions: body.conditions ?? existing.conditions,
       actions: body.actions ?? existing.actions,
     };
-    await assertDevicesInHome(
-      existing.home_id,
-      allDeviceIds({
-        trigger: merged.trigger,
-        conditions: merged.conditions,
-        actions: merged.actions,
-      } as z.infer<typeof automationSchema>),
-    );
+    if (body.conditions) assertHasFiringCondition(merged.conditions);
+    await assertDevicesAccessible(user.id, allDeviceIds(merged));
 
     const row = await transaction(async (client) => {
       const updated = await client.query<AutomationRow>(
@@ -170,7 +215,7 @@ export async function automationRoutes(app: FastifyInstance): Promise<void> {
            name = COALESCE($2, name),
            description = COALESCE($3, description),
            enabled = COALESCE($4, enabled),
-           trigger = COALESCE($5::jsonb, trigger),
+           match = COALESCE($5, match),
            conditions = COALESCE($6::jsonb, conditions),
            actions = COALESCE($7::jsonb, actions),
            cooldown_seconds = COALESCE($8, cooldown_seconds),
@@ -181,7 +226,7 @@ export async function automationRoutes(app: FastifyInstance): Promise<void> {
           body.name ?? null,
           body.description ?? null,
           body.enabled ?? null,
-          body.trigger ? JSON.stringify(body.trigger) : null,
+          body.match ?? null,
           body.conditions ? JSON.stringify(body.conditions) : null,
           body.actions ? JSON.stringify(body.actions) : null,
           body.cooldownSeconds ?? null,
@@ -190,11 +235,11 @@ export async function automationRoutes(app: FastifyInstance): Promise<void> {
       );
 
       // Rebuild the watch index whenever the devices a rule reads could change.
-      if (body.trigger || body.conditions) {
+      if (body.conditions) {
         await client.query('DELETE FROM automation_watches WHERE automation_id = $1', [
           automationId,
         ]);
-        for (const deviceId of watchedDeviceIds(merged.trigger, merged.conditions)) {
+        for (const deviceId of watchedDeviceIds(merged.conditions)) {
           await client.query(
             'INSERT INTO automation_watches (automation_id, device_id) VALUES ($1, $2)',
             [automationId, deviceId],

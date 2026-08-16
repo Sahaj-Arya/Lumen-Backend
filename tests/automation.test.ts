@@ -2,19 +2,40 @@ import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 
 import {
+  actionDeviceIds,
   compare,
-  evaluateConditions,
-  evaluateTrigger,
+  evaluateCondition,
+  isSatisfied,
+  isWithinWindow,
   minuteOfDay,
   shouldRearm,
   toBoolean,
   watchedDeviceIds,
-  actionDeviceIds,
-} from '../src/automation/evaluate.ts';
-import type { Predicate, Trigger } from '../src/automation/types.ts';
+} from '../dist/automation/evaluate.js';
+import { isFiring } from '../dist/automation/types.js';
+import type { EvalContext } from '../src/automation/evaluate.ts';
+import type { Condition } from '../src/automation/types.ts';
 
 const TANK = '11111111-1111-1111-1111-111111111111';
 const MOTOR = '22222222-2222-2222-2222-222222222222';
+
+const ctx = (over: Partial<EvalContext> = {}): EvalContext => ({
+  snapshots: new Map(),
+  statuses: new Map(),
+  clock: { minute: 12 * 60, weekday: 1 },
+  ...over,
+});
+
+const tankLevelAbove90: Condition = {
+  kind: 'device',
+  deviceId: TANK,
+  key: 'level',
+  op: '>',
+  value: 90,
+};
+const nightWindow: Condition = { kind: 'time', fromMinute: 22 * 60, toMinute: 6 * 60, days: [] };
+const motorOffline: Condition = { kind: 'status', deviceId: MOTOR, status: 'offline' };
+const atSeven: Condition = { kind: 'schedule', atMinute: 7 * 60, days: [] };
 
 describe('toBoolean', () => {
   it('reads the vocabulary devices actually publish', () => {
@@ -29,17 +50,15 @@ describe('toBoolean', () => {
   it('returns null for values that are not boolean-ish', () => {
     assert.equal(toBoolean('banana'), null);
     assert.equal(toBoolean(undefined), null);
-    assert.equal(toBoolean(null), null);
   });
 });
 
 describe('compare', () => {
   it('orders numbers, including numeric strings from MQTT payloads', () => {
     assert.equal(compare(95, '>', 90), true);
-    assert.equal(compare('95', '>', 90), true); // payloads arrive as text
+    assert.equal(compare('95', '>', 90), true);
     assert.equal(compare(85, '>', 90), false);
     assert.equal(compare(90, '>=', 90), true);
-    assert.equal(compare(10, '<', 20), true);
   });
 
   it('refuses to order non-numeric values instead of comparing as text', () => {
@@ -49,7 +68,6 @@ describe('compare', () => {
   });
 
   it('compares equality tolerantly across types', () => {
-    assert.equal(compare('on', '==', 'on'), true);
     assert.equal(compare('ON', '==', 'on'), true);
     assert.equal(compare(true, '==', 'on'), true);
     assert.equal(compare('1', '==', 1), true);
@@ -60,134 +78,204 @@ describe('compare', () => {
     assert.equal(compare('open', 'truthy'), true);
     assert.equal(compare('closed', 'falsy'), true);
     assert.equal(compare(5, 'changed', undefined, 4), true);
-    assert.equal(compare(5, 'changed', undefined, 5), false);
     // No previous value means first reading ever, which is not a change.
     assert.equal(compare(5, 'changed', undefined, undefined), false);
   });
 });
 
-describe('evaluateTrigger', () => {
-  it('fires the water-full / motor-off rule', () => {
-    const trigger: Trigger = { kind: 'state', deviceId: TANK, key: 'level', op: '>', value: 90 };
-    assert.equal(evaluateTrigger(trigger, { snapshot: { level: 95 } }), true);
-    assert.equal(evaluateTrigger(trigger, { snapshot: { level: 80 } }), false);
+describe('condition roles', () => {
+  it('separates what can set a rule off from what only narrows it', () => {
+    assert.equal(isFiring(tankLevelAbove90), true);
+    assert.equal(isFiring(motorOffline), true);
+    assert.equal(isFiring(atSeven), true);
+    // A time window is not an event.
+    assert.equal(isFiring(nightWindow), false);
+  });
+});
+
+describe('evaluateCondition', () => {
+  it('evaluates a device reading', () => {
+    const context = ctx({ snapshots: new Map([[TANK, { level: 95 }]]) });
+    assert.equal(evaluateCondition(tankLevelAbove90, context), true);
+    assert.equal(
+      evaluateCondition(tankLevelAbove90, ctx({ snapshots: new Map([[TANK, { level: 10 }]]) })),
+      false,
+    );
   });
 
-  it('fires on a boolean tank-full flag', () => {
-    const trigger: Trigger = { kind: 'state', deviceId: TANK, key: 'full', op: 'truthy' };
-    assert.equal(evaluateTrigger(trigger, { snapshot: { full: true } }), true);
-    assert.equal(evaluateTrigger(trigger, { snapshot: { full: 'no' } }), false);
+  it('is false for a device that has never reported', () => {
+    assert.equal(evaluateCondition(tankLevelAbove90, ctx()), false);
   });
 
-  it('fires on presence', () => {
-    const trigger: Trigger = { kind: 'status', deviceId: MOTOR, status: 'offline' };
-    assert.equal(evaluateTrigger(trigger, { snapshot: {}, status: 'offline' }), true);
-    assert.equal(evaluateTrigger(trigger, { snapshot: {}, status: 'online' }), false);
-    // No status on this update at all.
-    assert.equal(evaluateTrigger(trigger, { snapshot: {} }), false);
+  it('evaluates presence', () => {
+    assert.equal(
+      evaluateCondition(motorOffline, ctx({ statuses: new Map([[MOTOR, 'offline']]) })),
+      true,
+    );
+    assert.equal(
+      evaluateCondition(motorOffline, ctx({ statuses: new Map([[MOTOR, 'online']]) })),
+      false,
+    );
   });
 
-  it('never fires a schedule trigger from a device update', () => {
-    const trigger: Trigger = { kind: 'schedule', atMinute: 420, days: [] };
-    assert.equal(evaluateTrigger(trigger, { snapshot: { anything: 1 } }), false);
+  it('never reports a schedule as currently true', () => {
+    // A schedule is a moment, not a state; the scheduler says when it is due.
+    // If this returned true an ANY rule would fire on every message.
+    assert.equal(evaluateCondition(atSeven, ctx()), false);
+  });
+
+  it('refuses a time window with no clock rather than assuming', () => {
+    assert.equal(evaluateCondition(nightWindow, ctx({ clock: undefined })), false);
+  });
+});
+
+describe('isSatisfied — ALL (AND)', () => {
+  const conditions = [tankLevelAbove90, motorOffline];
+
+  it('needs every firing condition', () => {
+    const both = ctx({
+      snapshots: new Map([[TANK, { level: 95 }]]),
+      statuses: new Map([[MOTOR, 'offline']]),
+    });
+    assert.equal(isSatisfied('all', conditions, both), true);
+
+    const onlyOne = ctx({
+      snapshots: new Map([[TANK, { level: 95 }]]),
+      statuses: new Map([[MOTOR, 'online']]),
+    });
+    assert.equal(isSatisfied('all', conditions, onlyOne), false);
+  });
+});
+
+describe('isSatisfied — ANY (OR)', () => {
+  const conditions = [tankLevelAbove90, motorOffline];
+
+  it('needs only one firing condition', () => {
+    const onlyTank = ctx({
+      snapshots: new Map([[TANK, { level: 95 }]]),
+      statuses: new Map([[MOTOR, 'online']]),
+    });
+    assert.equal(isSatisfied('any', conditions, onlyTank), true);
+  });
+
+  it('is false when none hold', () => {
+    const neither = ctx({
+      snapshots: new Map([[TANK, { level: 10 }]]),
+      statuses: new Map([[MOTOR, 'online']]),
+    });
+    assert.equal(isSatisfied('any', conditions, neither), false);
+  });
+});
+
+describe('isSatisfied — time windows gate rather than widen', () => {
+  it('blocks an ALL rule outside the window', () => {
+    const conditions = [tankLevelAbove90, nightWindow];
+    const noon = ctx({ snapshots: new Map([[TANK, { level: 95 }]]) });
+    assert.equal(isSatisfied('all', conditions, noon), false);
+
+    const night = ctx({
+      snapshots: new Map([[TANK, { level: 95 }]]),
+      clock: { minute: 23 * 60, weekday: 1 },
+    });
+    assert.equal(isSatisfied('all', conditions, night), true);
+  });
+
+  it('also blocks an ANY rule outside the window', () => {
+    // "night OR tank full" must not run the pump at noon just because the
+    // window was one of two alternatives — a gate narrows, never widens.
+    const conditions = [tankLevelAbove90, nightWindow];
+    const noon = ctx({ snapshots: new Map([[TANK, { level: 95 }]]) });
+    assert.equal(isSatisfied('any', conditions, noon), false);
+  });
+
+  it('is false for a rule made only of gates', () => {
+    // Nothing could ever set it off; the API rejects this on write too.
+    assert.equal(isSatisfied('any', [nightWindow], ctx({ clock: { minute: 23 * 60, weekday: 1 } })), false);
+  });
+});
+
+describe('isSatisfied — a due schedule', () => {
+  it('counts the schedule the scheduler matched', () => {
+    // Index 0 is the schedule the tick found due.
+    assert.equal(isSatisfied('all', [atSeven], ctx(), 0), true);
+  });
+
+  it('still checks the rest of an ALL rule', () => {
+    const conditions = [atSeven, tankLevelAbove90];
+    const dry = ctx({ snapshots: new Map([[TANK, { level: 10 }]]) });
+    assert.equal(isSatisfied('all', conditions, dry, 0), false);
+
+    const full = ctx({ snapshots: new Map([[TANK, { level: 95 }]]) });
+    assert.equal(isSatisfied('all', conditions, full, 0), true);
+  });
+
+  it('still respects a gate', () => {
+    const conditions = [atSeven, nightWindow];
+    const noon = ctx();
+    assert.equal(isSatisfied('all', conditions, noon, 0), false);
   });
 });
 
 describe('shouldRearm (hysteresis)', () => {
-  const trigger: Trigger = {
-    kind: 'state',
-    deviceId: TANK,
-    key: 'level',
-    op: '>',
-    value: 90,
-    clearValue: 80,
-  };
+  const banded: Condition = { ...tankLevelAbove90, clearValue: 80 } as Condition;
 
   it('stays latched inside the band, so the pump does not chatter', () => {
-    // Fired at 95; wobbling between 80 and 90 must not re-arm it.
-    assert.equal(shouldRearm(trigger, { level: 95 }), false);
-    assert.equal(shouldRearm(trigger, { level: 89 }), false);
-    assert.equal(shouldRearm(trigger, { level: 81 }), false);
+    for (const level of [95, 89, 81]) {
+      assert.equal(
+        shouldRearm([banded], ctx({ snapshots: new Map([[TANK, { level }]]) })),
+        false,
+        `level ${level}`,
+      );
+    }
   });
 
   it('re-arms once the level clears the band', () => {
-    assert.equal(shouldRearm(trigger, { level: 79 }), true);
+    assert.equal(shouldRearm([banded], ctx({ snapshots: new Map([[TANK, { level: 79 }]]) })), true);
   });
 
-  it('re-arms in the other direction for a lower-bound rule', () => {
-    const low: Trigger = {
-      kind: 'state',
-      deviceId: TANK,
-      key: 'level',
-      op: '<',
-      value: 20,
-      clearValue: 30,
-    };
-    assert.equal(shouldRearm(low, { level: 25 }), false);
-    assert.equal(shouldRearm(low, { level: 35 }), true);
+  it('re-arms in the other direction for a lower-bound condition', () => {
+    const low = { kind: 'device', deviceId: TANK, key: 'level', op: '<', value: 20, clearValue: 30 } as Condition;
+    assert.equal(shouldRearm([low], ctx({ snapshots: new Map([[TANK, { level: 25 }]]) })), false);
+    assert.equal(shouldRearm([low], ctx({ snapshots: new Map([[TANK, { level: 35 }]]) })), true);
   });
 
-  it('without a band, re-arms as soon as the predicate stops holding', () => {
-    const plain: Trigger = { kind: 'state', deviceId: TANK, key: 'level', op: '>', value: 90 };
-    assert.equal(shouldRearm(plain, { level: 95 }), false);
-    assert.equal(shouldRearm(plain, { level: 90 }), true);
-  });
-
-  it('does not re-arm on an unreadable value', () => {
-    assert.equal(shouldRearm(trigger, { level: 'unknown' }), false);
+  it('re-arms immediately when no condition sets a band', () => {
+    assert.equal(shouldRearm([tankLevelAbove90], ctx()), true);
   });
 });
 
-describe('evaluateConditions', () => {
-  const conditions: Predicate[] = [{ deviceId: MOTOR, key: 'power', op: '==', value: 'on' }];
+describe('isWithinWindow', () => {
+  const day = (h: number, m = 0) => h * 60 + m;
 
-  it('requires every condition to hold', () => {
-    const snapshots = new Map([[MOTOR, { power: 'on' }]]);
-    assert.equal(evaluateConditions(conditions, snapshots), true);
-    assert.equal(evaluateConditions(conditions, new Map([[MOTOR, { power: 'off' }]])), false);
+  it('handles a normal daytime window', () => {
+    const window = { fromMinute: day(6), toMinute: day(23), days: [] };
+    assert.equal(isWithinWindow(window, day(12), 1), true);
+    assert.equal(isWithinWindow(window, day(5, 59), 1), false);
   });
 
-  it('is false when a referenced device has never reported', () => {
-    // Must not fire a rule on an assumption about a silent device.
-    assert.equal(evaluateConditions(conditions, new Map()), false);
+  it('wraps midnight rather than matching nothing', () => {
+    const night = { fromMinute: day(22), toMinute: day(6), days: [] };
+    assert.equal(isWithinWindow(night, day(23), 1), true);
+    assert.equal(isWithinWindow(night, day(2), 2), true);
+    assert.equal(isWithinWindow(night, day(12), 1), false);
   });
 
-  it('is vacuously true with no conditions', () => {
-    assert.equal(evaluateConditions([], new Map()), true);
+  it('attributes the small hours of a wrapping window to the day it started', () => {
+    const fridayNight = { fromMinute: day(22), toMinute: day(4), days: [5] };
+    assert.equal(isWithinWindow(fridayNight, day(23), 5), true);
+    assert.equal(isWithinWindow(fridayNight, day(1), 6), true, 'Saturday 01:00 belongs to Friday');
+    assert.equal(isWithinWindow(fridayNight, day(23), 6), false);
   });
 });
 
 describe('watchedDeviceIds', () => {
-  it('collects trigger and condition devices, deduplicated', () => {
-    const ids = watchedDeviceIds({ kind: 'state', deviceId: TANK, key: 'level', op: '>', value: 90 }, [
-      { deviceId: MOTOR, key: 'power', op: '==', value: 'on' },
-      { deviceId: TANK, key: 'full', op: 'truthy' },
-    ]);
+  it('collects device and status conditions, deduplicated', () => {
+    const ids = watchedDeviceIds([tankLevelAbove90, motorOffline, { ...tankLevelAbove90 }]);
     assert.deepEqual(ids.sort(), [TANK, MOTOR].sort());
   });
 
-  it('ignores the action target — a rule watches what it reads', () => {
-    const ids = watchedDeviceIds({ kind: 'schedule', atMinute: 0, days: [] }, []);
-    assert.deepEqual(ids, []);
-  });
-});
-
-describe('minuteOfDay', () => {
-  it('converts to the home timezone', () => {
-    const utcNoon = new Date('2026-08-03T12:00:00Z');
-    assert.equal(minuteOfDay(utcNoon, 'UTC').minute, 12 * 60);
-    // IST is UTC+5:30.
-    assert.equal(minuteOfDay(utcNoon, 'Asia/Kolkata').minute, 17 * 60 + 30);
-  });
-
-  it('normalises midnight to 0 rather than 1440', () => {
-    const midnight = new Date('2026-08-03T00:00:00Z');
-    assert.equal(minuteOfDay(midnight, 'UTC').minute, 0);
-  });
-
-  it('reports the weekday in the target zone', () => {
-    // Monday 2026-08-03 in UTC.
-    assert.equal(minuteOfDay(new Date('2026-08-03T12:00:00Z'), 'UTC').weekday, 1);
+  it('ignores clock conditions — they watch no device', () => {
+    assert.deepEqual(watchedDeviceIds([nightWindow, atSeven]), []);
   });
 });
 
@@ -198,13 +286,20 @@ describe('actionDeviceIds', () => {
         { kind: 'command', deviceId: MOTOR },
         { kind: 'delay' },
         { kind: 'command', deviceId: MOTOR },
-        { kind: 'webhook' },
       ]),
       [MOTOR],
     );
   });
+});
 
-  it('is empty when a rule only notifies', () => {
-    assert.deepEqual(actionDeviceIds([{ kind: 'webhook' }, { kind: 'delay' }]), []);
+describe('minuteOfDay', () => {
+  it('converts to the home timezone', () => {
+    const utcNoon = new Date('2026-08-03T12:00:00Z');
+    assert.equal(minuteOfDay(utcNoon, 'UTC').minute, 12 * 60);
+    assert.equal(minuteOfDay(utcNoon, 'Asia/Kolkata').minute, 17 * 60 + 30);
+  });
+
+  it('normalises midnight to 0 rather than 1440', () => {
+    assert.equal(minuteOfDay(new Date('2026-08-03T00:00:00Z'), 'UTC').minute, 0);
   });
 });

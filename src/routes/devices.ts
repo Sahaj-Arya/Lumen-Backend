@@ -28,9 +28,17 @@ const createBody = z.object({
   notes: z.string().trim().max(500).optional(),
 });
 
+/**
+ * Type is deliberately absent: it is chosen once, at claim time.
+ *
+ * The type decides which controls the app renders and which keys an automation
+ * may command, so changing it afterwards would silently invalidate every rule
+ * already written against the device. Zod strips unknown keys by default, which
+ * would make a client's attempt vanish without a word, so it is rejected
+ * explicitly below instead.
+ */
 const updateBody = z.object({
   name: z.string().trim().min(1).max(80).optional(),
-  type: z.string().trim().max(40).optional(),
   groupId: z.string().uuid().nullable().optional(),
   manufacturer: z.string().trim().max(80).optional(),
   model: z.string().trim().max(80).optional(),
@@ -249,6 +257,12 @@ export async function deviceRoutes(app: FastifyInstance): Promise<void> {
   app.patch('/:deviceId', async (request) => {
     const user = currentUser(request);
     const { deviceId } = z.object({ deviceId: z.string().uuid() }).parse(request.params);
+    if (request.body && typeof request.body === 'object' && 'type' in request.body) {
+      throw ApiError.badRequest(
+        'Device type is set when the device is claimed and cannot be changed afterwards — ' +
+          'automations are written against it. Remove and re-claim the device to change its type.',
+      );
+    }
     const body = updateBody.parse(request.body);
     const access = await requireDeviceAccess(user.id, deviceId, 'member');
 
@@ -263,18 +277,16 @@ export async function deviceRoutes(app: FastifyInstance): Promise<void> {
     const row = await queryOne<DeviceRow>(
       `UPDATE devices
           SET name = COALESCE($2, name),
-              type = COALESCE($3, type),
-              group_id = CASE WHEN $4::boolean THEN $5 ELSE group_id END,
-              manufacturer = COALESCE($6, manufacturer),
-              model = COALESCE($7, model),
-              notes = COALESCE($8, notes),
-              favourite = COALESCE($9, favourite)
+              group_id = CASE WHEN $3::boolean THEN $4 ELSE group_id END,
+              manufacturer = COALESCE($5, manufacturer),
+              model = COALESCE($6, model),
+              notes = COALESCE($7, notes),
+              favourite = COALESCE($8, favourite)
         WHERE id = $1
         RETURNING *`,
       [
         deviceId,
         body.name ?? null,
-        body.type ?? null,
         Object.prototype.hasOwnProperty.call(body, 'groupId'),
         body.groupId ?? null,
         body.manufacturer ?? null,

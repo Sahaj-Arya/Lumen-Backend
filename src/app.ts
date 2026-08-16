@@ -6,6 +6,7 @@ import Fastify from 'fastify';
 import { ZodError } from 'zod';
 
 import { ApiError } from './errors.js';
+import { activityRoutes } from './routes/activity.js';
 import { authRoutes } from './routes/auth.js';
 import { automationRoutes } from './routes/automations.js';
 import { catalogRoutes } from './routes/catalog.js';
@@ -17,6 +18,7 @@ import { logger } from './logger.js';
 import { profileRoutes } from './routes/profile.js';
 import { redis } from './redis/index.js';
 import { registerRealtime } from './realtime/ws.js';
+import { sceneRoutes } from './routes/scenes.js';
 import { telemetryRoutes } from './routes/telemetry.js';
 
 export async function buildApp() {
@@ -88,6 +90,8 @@ export async function buildApp() {
   await app.register(catalogRoutes, { prefix: '/api/catalog' });
   await app.register(authRoutes, { prefix: '/api/auth' });
   await app.register(automationRoutes, { prefix: '/api/automations' });
+  await app.register(sceneRoutes, { prefix: '/api/scenes' });
+  await app.register(activityRoutes, { prefix: '/api/activity' });
   await app.register(profileRoutes, { prefix: '/api' });
   await app.register(homeRoutes, { prefix: '/api/homes' });
   await app.register(deviceRoutes, { prefix: '/api/devices' });

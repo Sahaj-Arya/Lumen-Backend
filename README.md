@@ -208,6 +208,19 @@ changed truthy falsy`.
 device, the action commands another. Water-full-stops-the-motor is the worked
 example above.
 
+**Scope is the account, not one home.** A rule may reference any device the
+owner can reach, in any of their homes:
+
+- **one device** — trigger and target are the same device ('tank is full, close
+  its own valve'). Nothing else needs to exist.
+- **several devices in one home** — the usual case.
+- **across homes** — 'workshop tank is full, stop the house pump'.
+
+The rule still files under a single home for listing, taken from the trigger
+device so the caller never has to choose. Membership is still the boundary: a
+device outside the owner's account is refused at write time, and re-checked at
+every fire, so losing access to a home stops the rules that reached into it.
+
 Four guards, because a rule loop drives real hardware:
 
 - **Edge triggering** — fires on the false→true crossing, not on every message

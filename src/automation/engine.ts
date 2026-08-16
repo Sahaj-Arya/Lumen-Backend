@@ -2,15 +2,10 @@ import { logger } from '../logger.js';
 import { query, queryOne } from '../db/index.js';
 import { redis } from '../redis/index.js';
 import { publishCommand } from '../mqtt/bridge.js';
-import {
-  evaluateConditions,
-  evaluateTrigger,
-  minuteOfDay,
-  shouldRearm,
-  actionDeviceIds,
-} from './evaluate.js';
+import { actionDeviceIds, isSatisfied, minuteOfDay, shouldRearm } from './evaluate.js';
+import type { EvalContext } from './evaluate.js';
 import { ownerMayActuate } from './ownership.js';
-import type { Action, AutomationRow, ReadingSnapshot } from './types.js';
+import type { Action, AutomationRow, ReadingSnapshot, SceneRow } from './types.js';
 
 /**
  * Server-side rule engine.
@@ -33,6 +28,18 @@ const cooldownKey = (automationId: string) => `automation:cooldown:${automationI
 const MAX_CHAIN_DEPTH = 3;
 const chainKey = (deviceUid: string) => `automation:chain:${deviceUid}`;
 const CHAIN_TTL_SECONDS = 10;
+
+/**
+ * Wall-clock reading in the home's timezone, for time-window conditions. Rules
+ * are written against local time, so evaluating them in UTC would shift every
+ * window by the offset.
+ */
+async function homeClock(homeId: string): Promise<{ minute: number; weekday: number }> {
+  const row = await queryOne<{ timezone: string }>('SELECT timezone FROM homes WHERE id = $1', [
+    homeId,
+  ]);
+  return minuteOfDay(new Date(), row?.timezone || 'UTC');
+}
 
 async function readSnapshot(deviceId: string): Promise<ReadingSnapshot | null> {
   const rows = await query<{ key: string; value: unknown }>(
@@ -91,13 +98,33 @@ async function ownerStillAllowed(automation: AutomationRow): Promise<string | nu
   return check.ok ? null : check.reason;
 }
 
+/** Loads a scene the automation is allowed to run. */
+async function loadScene(sceneId: string, ownerId: string | null): Promise<SceneRow | null> {
+  return queryOne<SceneRow>(
+    `SELECT s.* FROM scenes s
+       JOIN home_members m ON m.home_id = s.home_id AND m.user_id = $2
+      WHERE s.id = $1`,
+    [sceneId, ownerId],
+  );
+}
+
+interface ActionSource {
+  id: string;
+  name: string;
+  homeId: string;
+  /** Whose access authorises the actions. Null means the account is gone. */
+  ownerId: string | null;
+  actions: Action[];
+  kind: 'automation' | 'scene';
+}
+
 async function runActions(
-  automation: AutomationRow,
+  source: ActionSource,
   chainDepth: number,
 ): Promise<{ ran: number; error?: string }> {
   let ran = 0;
 
-  for (const action of automation.actions as Action[]) {
+  for (const action of source.actions) {
     try {
       if (action.kind === 'delay') {
         await new Promise((resolve) => setTimeout(resolve, action.ms));
@@ -110,7 +137,7 @@ async function runActions(
           method: 'POST',
           headers: { 'content-type': 'application/json' },
           body: JSON.stringify({
-            automation: { id: automation.id, name: automation.name },
+            automation: { id: source.id, name: source.name },
             firedAt: new Date().toISOString(),
             ...(action.body ?? {}),
           }),
@@ -121,15 +148,46 @@ async function runActions(
         continue;
       }
 
+      if (action.kind === 'scene') {
+        // A rule running a scene is still one step deeper in the chain, so a
+        // scene that re-triggers the rule cannot loop forever.
+        const scene = await loadScene(action.sceneId, source.ownerId);
+        if (!scene) throw new Error('scene no longer exists or is not reachable by this rule\'s owner');
+        const nested = await runActions(
+          {
+            id: scene.id,
+            name: scene.name,
+            homeId: scene.home_id,
+            // The rule's owner authorises the scene it runs, not the scene's.
+            ownerId: source.ownerId,
+            actions: scene.actions,
+            kind: 'scene',
+          },
+          chainDepth + 1,
+        );
+        ran += nested.ran;
+        if (nested.error) throw new Error(nested.error);
+        continue;
+      }
+
       // command
       const device = await queryOne<{ device_uid: string; home_id: string }>(
         'SELECT device_uid, home_id FROM devices WHERE id = $1',
         [action.deviceId],
       );
       if (!device) throw new Error(`action target device ${action.deviceId} no longer exists`);
-      // A rule may only actuate devices in its own home.
-      if (device.home_id !== automation.home_id) {
-        throw new Error('action target belongs to a different home');
+      // The boundary is the owner's membership, not the rule's own home: a rule
+      // may drive any device its owner can reach, including one in another of
+      // their homes. `ownerStillAllowed` pre-checks the whole action list, and
+      // this re-checks per device so a scene reached indirectly is covered too.
+      const reachable = await queryOne<{ id: string }>(
+        `SELECT d.id FROM devices d
+           JOIN home_members m ON m.home_id = d.home_id AND m.user_id = $2
+          WHERE d.id = $1`,
+        [action.deviceId, source.ownerId],
+      );
+      if (!reachable) {
+        throw new Error('action target is not reachable by this rule\'s owner');
       }
 
       // Tag the target so an update it emits inherits this chain depth.
@@ -144,19 +202,67 @@ async function runActions(
   return { ran };
 }
 
+const asSource = (automation: AutomationRow): ActionSource => ({
+  id: automation.id,
+  name: automation.name,
+  homeId: automation.home_id,
+  ownerId: automation.owner_id,
+  actions: automation.actions,
+  kind: 'automation',
+});
+
+/**
+ * Assembles everything a rule needs to be judged: the readings and presence of
+ * every device it mentions, plus the home's wall clock.
+ */
+async function buildContext(
+  automation: AutomationRow,
+  overrides?: { deviceId: string; snapshot: ReadingSnapshot; previous?: ReadingSnapshot; status?: 'online' | 'offline' },
+): Promise<EvalContext> {
+  const ids = [
+    ...new Set(
+      automation.conditions.flatMap((condition) =>
+        condition.kind === 'device' || condition.kind === 'status' ? [condition.deviceId] : [],
+      ),
+    ),
+  ];
+
+  const snapshots = new Map<string, ReadingSnapshot>();
+  const statuses = new Map<string, 'online' | 'offline' | null>();
+  const previous = new Map<string, ReadingSnapshot>();
+
+  for (const id of ids) {
+    const snapshot = await readSnapshot(id);
+    if (snapshot) snapshots.set(id, snapshot);
+    const row = await queryOne<{ status: string }>('SELECT status FROM devices WHERE id = $1', [id]);
+    statuses.set(id, (row?.status as 'online' | 'offline') ?? null);
+  }
+
+  // The message being processed is fresher than anything already stored.
+  if (overrides) {
+    snapshots.set(overrides.deviceId, overrides.snapshot);
+    if (overrides.previous) previous.set(overrides.deviceId, overrides.previous);
+    if (overrides.status) statuses.set(overrides.deviceId, overrides.status);
+  }
+
+  return { snapshots, previous, statuses, clock: await homeClock(automation.home_id) };
+}
+
 async function considerAutomation(
   automation: AutomationRow,
-  context: { snapshot: ReadingSnapshot; previous?: ReadingSnapshot; status?: 'online' | 'offline' },
+  context: { deviceId: string; snapshot: ReadingSnapshot; previous?: ReadingSnapshot; status?: 'online' | 'offline' } | undefined,
   chainDepth: number,
+  firedIndex?: number,
 ): Promise<void> {
-  const satisfied = evaluateTrigger(automation.trigger, context);
+  const evalContext = await buildContext(automation, context);
+  const satisfied = isSatisfied(automation.match, automation.conditions, evalContext, firedIndex);
 
-  // Edge triggering: only act on the false -> true crossing, and re-arm when
-  // the reading clears (respecting a hysteresis band if the rule sets one).
+  // Edge triggering: act on the false -> true crossing of the rule as a whole,
+  // and re-arm when it clears (respecting any hysteresis band it sets).
   if (automation.edge_triggered) {
     const armed = (await redis.get(armedKey(automation.id))) !== 'fired';
     if (!satisfied) {
-      if (!armed && shouldRearm(automation.trigger, context.snapshot)) {
+      if (!armed && shouldRearm(automation.conditions, evalContext)) {
         await redis.del(armedKey(automation.id));
       }
       return;
@@ -188,20 +294,11 @@ async function considerAutomation(
     }
   }
 
-  const conditionSnapshots = await loadSnapshots(
-    automation.conditions.map((condition) => condition.deviceId),
-  );
-  if (!evaluateConditions(automation.conditions, conditionSnapshots)) {
-    await record(automation.id, 'skipped', { reason: 'condition' });
-    return;
-  }
-
   if (automation.edge_triggered) {
     await redis.set(armedKey(automation.id), 'fired', 'EX', 24 * 60 * 60);
   }
 
-  const triggerValue =
-    automation.trigger.kind === 'state' ? context.snapshot[automation.trigger.key] : context.status;
+  const triggerValue = context?.status ?? context?.snapshot ?? null;
 
   const denied = await ownerStillAllowed(automation);
   if (denied) {
@@ -210,7 +307,7 @@ async function considerAutomation(
     return;
   }
 
-  const result = await runActions(automation, chainDepth);
+  const result = await runActions(asSource(automation), chainDepth);
   await query(
     'UPDATE automations SET last_triggered_at = now(), run_count = run_count + 1 WHERE id = $1',
     [automation.id],
@@ -256,7 +353,12 @@ export async function onDeviceUpdate(input: {
     try {
       await considerAutomation(
         rule,
-        { snapshot: input.snapshot, previous: input.previous, status: input.status },
+        {
+          deviceId: input.deviceId,
+          snapshot: input.snapshot,
+          previous: input.previous,
+          status: input.status,
+        },
         chainDepth,
       );
     } catch (error) {
@@ -267,23 +369,37 @@ export async function onDeviceUpdate(input: {
 }
 
 /** Fires any schedule-triggered rule due this minute. Called once a minute. */
+/**
+ * Fires any rule with a schedule condition due this minute. Called once a
+ * minute.
+ *
+ * The scheduler only decides *which* condition came due — the rule still has
+ * to satisfy its match mode and its gates, so 'at 07:00 AND the tank is low'
+ * checks the tank before acting.
+ */
 export async function tickSchedules(now = new Date()): Promise<number> {
   const rules = await query<AutomationRow & { timezone: string }>(
     `SELECT a.*, h.timezone FROM automations a
        JOIN homes h ON h.id = a.home_id
-      WHERE a.enabled AND a.trigger->>'kind' = 'schedule'`,
+      WHERE a.enabled AND a.conditions @> '[{kind:schedule}]'::jsonb`,
   );
 
   let fired = 0;
   for (const rule of rules.rows) {
-    if (rule.trigger.kind !== 'schedule') continue;
     const { minute, weekday } = minuteOfDay(now, rule.timezone || 'UTC');
-    if (minute !== rule.trigger.atMinute) continue;
-    if (rule.trigger.days.length > 0 && !rule.trigger.days.includes(weekday)) continue;
+
+    // Which schedule condition, if any, matches this minute?
+    const dueIndex = rule.conditions.findIndex(
+      (condition) =>
+        condition.kind === 'schedule' &&
+        condition.atMinute === minute &&
+        (condition.days.length === 0 || condition.days.includes(weekday)),
+    );
+    if (dueIndex === -1) continue;
 
     try {
-      // Schedules have no reading to latch on, so they rely on the cooldown
-      // (defaulted past 60s by the route) not to double-fire within a minute.
+      // A schedule lands on a minute boundary, so the cooldown floor keeps two
+      // ticks in the same minute from double-firing it.
       const claimed = await redis.set(
         cooldownKey(rule.id),
         '1',
@@ -292,28 +408,8 @@ export async function tickSchedules(now = new Date()): Promise<number> {
         'NX',
       );
       if (claimed === null) continue;
-
-      const snapshots = await loadSnapshots(rule.conditions.map((c) => c.deviceId));
-      if (!evaluateConditions(rule.conditions, snapshots)) {
-        await record(rule.id, 'skipped', { reason: 'condition' });
-        continue;
-      }
-
-      const scheduleDenied = await ownerStillAllowed(rule);
-      if (scheduleDenied) {
-        await record(rule.id, 'skipped', { reason: scheduleDenied });
-        continue;
-      }
-
-      const result = await runActions(rule, 0);
-      await query(
-        'UPDATE automations SET last_triggered_at = now(), run_count = run_count + 1 WHERE id = $1',
-        [rule.id],
-      );
-      await record(rule.id, result.error ? 'failed' : 'fired', {
-        actionsRun: result.ran,
-        error: result.error,
-      });
+      // Already claimed the cooldown, so let the shared path skip its own.
+      await considerAutomation({ ...rule, cooldown_seconds: 0 }, undefined, 0, dueIndex);
       fired += 1;
     } catch (error) {
       logger.error({ err: error, automationId: rule.id }, 'scheduled automation failed');
@@ -331,7 +427,7 @@ export async function runNow(automation: AutomationRow): Promise<{ ran: number; 
     return { ran: 0, error: 'Owner no longer has access to these devices' };
   }
 
-  const result = await runActions(automation, 0);
+  const result = await runActions(asSource(automation), 0);
   await record(automation.id, result.error ? 'failed' : 'fired', {
     reason: 'manual',
     actionsRun: result.ran,
@@ -356,4 +452,29 @@ export function startScheduler(): void {
 export function stopScheduler(): void {
   if (timer) clearTimeout(timer);
   timer = null;
+}
+
+/** Runs a scene's actions now. Used by the API's tap-to-run endpoint. */
+export async function runScene(scene: SceneRow): Promise<{ ran: number; error?: string }> {
+  const result = await runActions(
+    {
+      id: scene.id,
+      name: scene.name,
+      homeId: scene.home_id,
+      ownerId: scene.owner_id,
+      actions: scene.actions,
+      kind: 'scene',
+    },
+    0,
+  );
+  await query(
+    'UPDATE scenes SET last_run_at = now(), run_count = run_count + 1 WHERE id = $1',
+    [scene.id],
+  );
+  await query(
+    `INSERT INTO automation_runs (scene_id, status, reason, actions_run, error)
+     VALUES ($1, $2, 'manual', $3, $4)`,
+    [scene.id, result.error ? 'failed' : 'fired', result.ran, result.error ?? null],
+  );
+  return result;
 }
