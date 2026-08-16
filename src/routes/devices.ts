@@ -131,7 +131,19 @@ export async function deviceRoutes(app: FastifyInstance): Promise<void> {
       [user.id, filter.homeId ?? null, filter.groupId ?? null],
     );
 
-    return { devices: rows.rows.map(present) };
+    // Current values come along with the list. They are already in Redis (the
+    // retained state the broker replayed on connect), so this costs one cheap
+    // read per device -- and without it a freshly opened app shows a grid of
+    // devices with no values and every toggle off until each one is opened.
+    const readings = Object.fromEntries(
+      await Promise.all(
+        rows.rows.map(
+          async (row) => [row.id, (await readCachedState(row.device_uid)).readings] as const,
+        ),
+      ),
+    );
+
+    return { devices: rows.rows.map(present), readings };
   });
 
   /**
