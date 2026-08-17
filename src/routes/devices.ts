@@ -1,4 +1,4 @@
-import type { FastifyInstance } from 'fastify';
+import type { FastifyInstance, FastifyReply } from 'fastify';
 import { z } from 'zod';
 
 import { ApiError } from '../errors.js';
@@ -46,6 +46,62 @@ const updateBody = z.object({
   notes: z.string().trim().max(500).optional(),
   favourite: z.boolean().optional(),
 });
+
+/**
+ * The payload a device puts in its QR code, built by the firmware in
+ * `Lumen-Devices/main/device.c`.
+ *
+ * Identity only, and none of it is trusted for authorisation: whoever scanned
+ * the code still has to be a member of the home they are claiming into, and the
+ * uid is validated exactly as a hand-typed one is. A QR code saves someone
+ * typing 64 characters; it is not a credential, because anyone who can
+ * photograph a device can reproduce it.
+ */
+const claimPayload = z.object({
+  v: z.literal(1),
+  id: DEVICE_UID,
+  name: z.string().trim().max(80).optional(),
+  type: z.string().trim().max(40).optional(),
+  comp: z.string().trim().max(40).optional(),
+  mac: z.string().trim().max(32).optional(),
+  model: z.string().trim().max(80).optional(),
+  fw: z.string().trim().max(40).optional(),
+  root: z.string().trim().max(40).optional(),
+  disc: z.string().trim().max(40).optional(),
+});
+
+/**
+ * Accepts the whole scanned string as well as an already-decoded object,
+ * because what a scanner hands over varies: the full URL, the bare base64url
+ * fragment, or JSON somebody pasted.
+ */
+const claimBody = z.object({
+  payload: z.union([z.string().trim().min(1), claimPayload]),
+});
+
+function decodeClaim(payload: string | z.infer<typeof claimPayload>): z.infer<typeof claimPayload> {
+  if (typeof payload !== 'string') return payload;
+
+  const text = payload.trim();
+  let json: string;
+  if (text.startsWith('{')) {
+    json = text;
+  } else {
+    const hash = text.indexOf('#');
+    const encoded = (hash >= 0 ? text.slice(hash + 1) : text).replace(/-/g, '+').replace(/_/g, '/');
+    // The firmware drops base64 padding to keep the printed code small.
+    const padded = encoded + '='.repeat((4 - (encoded.length % 4)) % 4);
+    json = Buffer.from(padded, 'base64').toString('utf8');
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(json);
+  } catch {
+    throw ApiError.badRequest('That code is not a Lumen device code');
+  }
+  return claimPayload.parse(parsed);
+}
 
 const commandBody = z.object({
   // A command is a patch of key -> value, e.g. {"state":"ON","brightness":128}
@@ -154,12 +210,51 @@ export async function deviceRoutes(app: FastifyInstance): Promise<void> {
   app.get('/unclaimed', async () => ({ deviceUids: await listUnclaimed() }));
 
   // ──────────────────────── provisioning ────────────────────────
-  app.post('/', async (request, reply) => {
+
+  /**
+   * Claim a device from its QR code.
+   *
+   * The same claim as `POST /` — same uniqueness rule, same credential, same
+   * audit entry — reached without anyone transcribing a device id. It is a
+   * separate route rather than an extra field on the existing body because the
+   * input is a scanned string of unknown shape that has to be decoded and
+   * validated before it can be treated as a claim at all.
+   *
+   * Scanning proves nothing about who is scanning: membership of the home is
+   * still required, and a device already claimed still conflicts.
+   */
+  app.post('/from-qr', async (request, reply) => {
     const user = currentUser(request);
-    const body = createBody.parse(request.body);
+    const { payload } = claimBody.parse(request.body);
     const { homeId } = z.object({ homeId: z.string().uuid() }).parse(request.query);
     await requireHomeRole(user.id, homeId, 'member');
 
+    const claim = decodeClaim(payload);
+    // Goes through the same claim as a typed-in id, so the two routes cannot
+    // drift on what claiming means.
+    return claimDevice(reply, homeId, user.id, {
+      deviceUid: claim.id,
+      name: claim.name,
+      type: claim.type ?? 'generic',
+      model: claim.model,
+    });
+  });
+
+  app.post('/', async (request, reply) => {
+    const user = currentUser(request);
+    const { homeId } = z.object({ homeId: z.string().uuid() }).parse(request.query);
+    await requireHomeRole(user.id, homeId, 'member');
+    return claimDevice(reply, homeId, user.id, createBody.parse(request.body));
+  });
+
+  /** The claim itself, shared by the typed and the scanned routes. Callers have
+   *  already checked the user may write to this home. */
+  async function claimDevice(
+    reply: FastifyReply,
+    homeId: string,
+    userId: string,
+    body: z.infer<typeof createBody>,
+  ) {
     const taken = await queryOne<{ id: string }>('SELECT id FROM devices WHERE device_uid = $1', [
       body.deviceUid,
     ]);
@@ -210,7 +305,7 @@ export async function deviceRoutes(app: FastifyInstance): Promise<void> {
     );
 
     await audit({
-      userId: user.id,
+      userId,
       homeId,
       action: 'device.claim',
       subject: body.deviceUid,
@@ -225,7 +320,7 @@ export async function deviceRoutes(app: FastifyInstance): Promise<void> {
         note: 'Shown once. Register it on the broker with scripts/add-device.mjs and restart the broker.',
       },
     });
-  });
+  }
 
   app.post('/:deviceId/credentials', async (request) => {
     const user = currentUser(request);
