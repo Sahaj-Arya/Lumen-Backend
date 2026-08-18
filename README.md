@@ -23,6 +23,40 @@ Node can open a raw TLS socket, so the backend uses the native `mqtts://…:8883
 endpoint rather than the WebSocket one the phone was limited to. Per-user access
 is enforced in the API, not by handing out broker credentials.
 
+## Devices that are groups
+
+A board is often not one thing. It is pins, with a relay on one and a sensor on
+another, and each of those is its own entity with its own topics:
+
+```
+devices/<uid>/gpio5/state     retained, that pin's value
+devices/<uid>/gpio5/set       a command for that pin alone
+homeassistant/switch/<uid>/gpio5/config
+```
+
+Three rules make that work end to end:
+
+- **`<uid>/<segment>/<leaf>` is a channel** only when the leaf is one of
+  `state`, `set`, `cmd`, `availability`, `telemetry`, `attributes`. Everything
+  else stays a nested reading key, so `devices/x/power/today` is still a reading
+  called `power.today` and does not silently become a channel called `power`.
+- **A node-scoped discovery config belongs to its device.** `unique_id` is
+  per-entity there (`lumen-6f1234_gpio5`); letting it win would file every pin
+  as a separate device, so `device.identifiers` and the node id win instead.
+  That is what identifiers are for.
+- **A channel's value is stored flat**, under the channel name: `gpio5` is the
+  relay's state and `gpio5.brightness` its level. Automations, history and the
+  app already understand flat keys, so per-pin values work in all three without
+  a special case.
+
+Channels are cached in Redis, never in a table: the device re-announces every
+one on each connect, so a row would be a second copy that can only be wrong. A
+pin removed from a device's map stops being listed when it next reconnects.
+
+`POST /api/devices/:id/commands` takes an optional `channel`. Without one it
+publishes to `devices/<uid>/set` — right for a board that is one thing, and
+heard by nobody on a board that is a group.
+
 ## Stack
 
 | Concern | Choice | Why |

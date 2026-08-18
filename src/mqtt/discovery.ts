@@ -165,14 +165,64 @@ export function typeFromDiscovery(component: string, config: DiscoveryConfig): s
 }
 
 /**
- * The uid a config belongs to. `unique_id` wins over the topic's object id
- * because that is the field the rest of the ecosystem treats as identity, and
- * some firmware puts a per-entity suffix in the topic.
+ * The uid a config belongs to.
+ *
+ * A node id in the topic means the config is one entity of a device that has
+ * several -- a relay on one pin, a sensor on another. There, `unique_id` is
+ * per-entity (`lumen-6f1234_gpio5`) and would file every pin as a separate
+ * device, so the node id and the shared `device.identifiers` win instead. That
+ * is exactly what those fields are for: identifiers are what every hub uses to
+ * group entities into one physical thing.
+ *
+ * Without a node id there is one entity, and `unique_id` is the identity the
+ * rest of the ecosystem uses -- some firmware puts a suffix in the topic.
  */
 export function uidFromDiscovery(parsed: ParsedDiscoveryTopic, config: DiscoveryConfig): string {
   const identifiers = config.device?.identifiers;
   const identifier = Array.isArray(identifiers) ? identifiers[0] : identifiers;
+  if (parsed.nodeId) return String(identifier ?? parsed.nodeId);
   return String(config.unique_id ?? identifier ?? parsed.objectId);
+}
+
+/**
+ * The entity within the device this config describes, or null when it is the
+ * device itself. The object id is the channel -- `gpio5` -- which is also the
+ * segment its state and command topics sit under.
+ */
+export function channelFromDiscovery(parsed: ParsedDiscoveryTopic): string | null {
+  return parsed.nodeId ? parsed.objectId : null;
+}
+
+/** What the app needs to render one channel without asking the device. */
+export interface ChannelDescriptor {
+  channel: string;
+  component: string;
+  name: string;
+  /** Our own kind -- relay, motion, analog -- when the firmware declared one. */
+  kind: string | null;
+  deviceClass: string | null;
+  unit: string | null;
+  /** A command topic in the config is what makes an entity controllable. */
+  writable: boolean;
+  gpio: number | null;
+}
+
+export function channelFromConfig(
+  channel: string,
+  component: string,
+  config: DiscoveryConfig,
+): ChannelDescriptor {
+  const gpio = config.lumen_gpio;
+  return {
+    channel,
+    component,
+    name: String(config.name ?? channel),
+    kind: config.lumen_kind ? String(config.lumen_kind) : null,
+    deviceClass: config.device_class ? String(config.device_class) : null,
+    unit: config.unit_of_measurement ? String(config.unit_of_measurement) : null,
+    writable: Boolean(config.command_topic),
+    gpio: typeof gpio === 'number' ? gpio : null,
+  };
 }
 
 /** The subset worth keeping on the device row. */

@@ -14,26 +14,60 @@ describe('parseDeviceTopic', () => {
       deviceUid: 'esp32-01',
       kind: 'availability',
       key: 'availability',
+      channel: null,
     });
     assert.deepEqual(parseDeviceTopic('devices/s1/state'), {
       deviceUid: 's1',
       kind: 'state',
       key: null,
+      channel: null,
     });
     assert.deepEqual(parseDeviceTopic('devices/s1/attributes'), {
       deviceUid: 's1',
       kind: 'attributes',
       key: null,
+      channel: null,
     });
     assert.deepEqual(parseDeviceTopic('devices/s1/telemetry'), {
       deviceUid: 's1',
       kind: 'telemetry',
       key: null,
+      channel: null,
     });
     assert.deepEqual(parseDeviceTopic('devices/s1/set'), {
       deviceUid: 's1',
       kind: 'command',
       key: null,
+      channel: null,
+    });
+  });
+
+  it('reads a channel out of <uid>/<channel>/<leaf>', () => {
+    // A device can be a group of things wired to its pins; each is addressed
+    // on its own leaf under the pin it sits on.
+    assert.deepEqual(parseDeviceTopic('devices/lumen-6f1234/gpio5/state'), {
+      deviceUid: 'lumen-6f1234',
+      kind: 'state',
+      key: null,
+      channel: 'gpio5',
+    });
+    assert.deepEqual(parseDeviceTopic('devices/lumen-6f1234/gpio5/set'), {
+      deviceUid: 'lumen-6f1234',
+      kind: 'command',
+      key: null,
+      channel: 'gpio5',
+    });
+  });
+
+  it('keeps a nested reading key a reading, not a channel', () => {
+    // Only a closed set of leaves promotes the segment before them. Without
+    // that rule `devices/x/power/today` would silently become a channel called
+    // `power`, and the reading it actually is would vanish.
+    assert.deepEqual(parseDeviceTopic('devices/s1/power/today'), {
+      deviceUid: 's1',
+      kind: 'reading',
+      key: 'power.today',
+      channel: null,
     });
   });
 
@@ -43,22 +77,26 @@ describe('parseDeviceTopic', () => {
       deviceUid: 's1',
       kind: 'availability',
       key: 'status',
+      channel: null,
     });
     assert.deepEqual(parseDeviceTopic('devices/s1/meta'), {
       deviceUid: 's1',
       kind: 'attributes',
       key: null,
+      channel: null,
     });
     assert.deepEqual(parseDeviceTopic('devices/s1/cmd'), {
       deviceUid: 's1',
       kind: 'command',
       key: null,
+      channel: null,
     });
     // Zigbee2MQTT puts the whole state object on the bare device topic.
     assert.deepEqual(parseDeviceTopic('devices/s1'), {
       deviceUid: 's1',
       kind: 'state',
       key: null,
+      channel: null,
     });
   });
 
@@ -67,12 +105,14 @@ describe('parseDeviceTopic', () => {
       deviceUid: 's1',
       kind: 'reading',
       key: 'temp',
+      channel: null,
     });
     // Nested paths flatten to a dotted key.
     assert.deepEqual(parseDeviceTopic('devices/s1/sensor/indoor/temp'), {
       deviceUid: 's1',
       kind: 'reading',
       key: 'sensor.indoor.temp',
+      channel: null,
     });
   });
 

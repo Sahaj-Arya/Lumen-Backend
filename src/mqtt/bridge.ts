@@ -17,10 +17,13 @@ import {
 import {
   DISCOVERY_PREFIX,
   capabilitiesFromDiscovery,
+  channelFromConfig,
+  channelFromDiscovery,
   declaredType,
   parseDiscoveryTopic,
   typeFromDiscovery,
   uidFromDiscovery,
+  type ChannelDescriptor,
   type DiscoveryConfig,
 } from './discovery.js';
 import { DEVICE_TYPES, canonicalKey, normalizeType } from '../model/deviceTypes.js';
@@ -132,14 +135,50 @@ export async function stopBridge(): Promise<void> {
 }
 
 /** Publishes a command patch. QoS 1, never retained — commands are events. */
+/**
+ * What a device's channels are, cached from their discovery configs.
+ *
+ * Redis rather than a table: the device is the authority and re-announces
+ * every one of these on each connect, so a row would be a second copy that can
+ * only be wrong. A channel that stops being announced -- a pin removed from the
+ * map -- stops being listed the next time the device reconnects, because the
+ * whole set is rewritten rather than merged.
+ */
+async function rememberChannel(deviceUid: string, descriptor: ChannelDescriptor): Promise<void> {
+  const existing = await readChannels(deviceUid);
+  const next = [
+    ...existing.filter((entry) => entry.channel !== descriptor.channel),
+    descriptor,
+  ].sort((a, b) => (a.gpio ?? 0) - (b.gpio ?? 0) || a.channel.localeCompare(b.channel));
+
+  await redis.hset(keys.deviceState(deviceUid), { channels: JSON.stringify(next) });
+}
+
+export async function readChannels(deviceUid: string): Promise<ChannelDescriptor[]> {
+  const raw = await redis.hget(keys.deviceState(deviceUid), 'channels');
+  if (!raw) return [];
+  try {
+    const parsed = JSON.parse(raw) as ChannelDescriptor[];
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
 export async function publishCommand(
   deviceUid: string,
   patch: Record<string, unknown>,
+  channel?: string | null,
 ): Promise<string> {
   if (!client || !connected) {
     throw ApiError.unavailable('Not connected to the MQTT broker');
   }
-  const topic = topics.command(config.MQTT_BASE_TOPIC, deviceUid);
+  // A device with things on its pins answers per pin. Commanding the device
+  // itself would reach whatever its single-entity firmware does, which for a
+  // board holding a relay and a sensor is nothing.
+  const topic = channel
+    ? topics.channelCommand(config.MQTT_BASE_TOPIC, deviceUid, channel)
+    : topics.command(config.MQTT_BASE_TOPIC, deviceUid);
 
   await new Promise<void>((resolve, reject) => {
     client!.publish(topic, JSON.stringify(patch), { qos: 1, retain: false }, (error) =>
@@ -224,6 +263,16 @@ async function handleDiscovery(topic: string, payload: string): Promise<void> {
 
   // Cached whether or not the device is claimed, so the Add device screen can
   // show what an unclaimed device says it is.
+  const channel = channelFromDiscovery(parsed);
+  if (channel) {
+    // One entity of a device that has several. Its own type must not become the
+    // device's -- a board is not a relay because its first pin is one -- so
+    // only the channel list is updated here.
+    await rememberChannel(deviceUid, channelFromConfig(channel, parsed.component, config));
+    logger.info({ deviceUid, channel, component: parsed.component }, 'channel discovered');
+    return;
+  }
+
   await redis.hset(keys.deviceState(deviceUid), {
     discoveredType: type,
     discoveredName: String(config.name ?? config.device?.name ?? ''),
@@ -259,6 +308,34 @@ async function handleMessage(topic: string, payload: string, retained: boolean):
   const at = Date.now();
   const update: DeviceUpdate = { deviceUid: parsed.deviceUid, at };
   const readings: Record<string, ReadingValue> = {};
+
+  // One pin of a device that has several. Its value is stored under the
+  // channel name, so `gpio5` is the relay's state and `gpio5.brightness` is its
+  // extra -- flat keys the app, the automation engine and the history table all
+  // already understand, rather than a nested shape only new code could read.
+  if (parsed.channel) {
+    if (parsed.kind === 'state' || parsed.kind === 'telemetry') {
+      if (payload.trim() === '' && retained) {
+        await clearReading(parsed.deviceUid, parsed.channel);
+        return;
+      }
+      const value = parseReadingPayload(payload);
+      if (value && typeof value === 'object' && !Array.isArray(value)) {
+        for (const [key, nested] of Object.entries(flatten(value) as Record<string, ReadingValue>)) {
+          // `state` is the channel's own value, not a sub-reading of it.
+          readings[key === 'state' ? parsed.channel : `${parsed.channel}.${key}`] = nested;
+        }
+      } else if (value !== '') {
+        readings[parsed.channel] = value;
+      }
+    }
+    // Availability per channel is not a thing here: a pin is reachable exactly
+    // when its board is, and the board already publishes that.
+    if (Object.keys(readings).length === 0) return;
+    update.readings = readings;
+    await applyUpdate(parsed.deviceUid, update, retained);
+    return;
+  }
 
   switch (parsed.kind) {
     case 'availability': {
@@ -310,10 +387,29 @@ async function handleMessage(topic: string, payload: string, retained: boolean):
     }
   }
 
-  const device = await lookupDevice(parsed.deviceUid);
+  update.readings = readings;
+  await applyUpdate(parsed.deviceUid, update, retained);
+}
 
-  const named = canonicalizeReadings(device?.type ?? null, readings);
+/**
+ * Everything that happens to an update once its shape is known: canonicalise,
+ * cache, persist, wake the automation engine, fan out to WebSocket clients.
+ *
+ * Shared so a channel's reading takes exactly the same path as a device's.
+ * Anything less and per-pin values would be invisible to automations, or
+ * absent from history, in ways nobody would notice until a rule silently
+ * never fired.
+ */
+async function applyUpdate(
+  deviceUid: string,
+  update: DeviceUpdate,
+  retained: boolean,
+): Promise<void> {
+  const device = await lookupDevice(deviceUid);
+
+  const named = canonicalizeReadings(device?.type ?? null, update.readings ?? {});
   if (Object.keys(named).length > 0) update.readings = named;
+  else delete update.readings;
   if (!update.status && !update.readings) return;
 
   await cacheState(update, retained);
@@ -329,7 +425,7 @@ async function handleMessage(topic: string, payload: string, retained: boolean):
       // Automations must never block or break ingest.
       updateHook({
         deviceId: device.id,
-        deviceUid: parsed.deviceUid,
+        deviceUid,
         snapshot,
         previous,
         status: update.status,

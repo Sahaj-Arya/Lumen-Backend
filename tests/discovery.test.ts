@@ -3,6 +3,8 @@ import { describe, it } from 'node:test';
 
 import {
   capabilitiesFromDiscovery,
+  channelFromConfig,
+  channelFromDiscovery,
   declaredType,
   parseDiscoveryTopic,
   typeFromDiscovery,
@@ -68,18 +70,88 @@ describe('declaredType', () => {
 });
 
 describe('uidFromDiscovery', () => {
-  const topic = { component: 'light', objectId: 'entity-1', nodeId: 'lumen-6f1234' };
+  const flat = { component: 'light', objectId: 'entity-1', nodeId: null };
+  const scoped = { component: 'switch', objectId: 'gpio5', nodeId: 'lumen-6f1234' };
 
-  it('prefers unique_id over the topic segment', () => {
-    assert.equal(uidFromDiscovery(topic, { unique_id: 'lumen-6f1234' }), 'lumen-6f1234');
+  it('prefers unique_id over the topic segment for a lone entity', () => {
+    assert.equal(uidFromDiscovery(flat, { unique_id: 'lumen-6f1234' }), 'lumen-6f1234');
   });
 
   it('falls back to the device identifier, then the topic', () => {
     assert.equal(
-      uidFromDiscovery(topic, { device: { identifiers: ['lumen-aabbcc'] } }),
+      uidFromDiscovery(flat, { device: { identifiers: ['lumen-aabbcc'] } }),
       'lumen-aabbcc',
     );
-    assert.equal(uidFromDiscovery(topic, {}), 'entity-1');
+    assert.equal(uidFromDiscovery(flat, {}), 'entity-1');
+  });
+
+  it('files a node-scoped entity under its device, not under itself', () => {
+    // unique_id is per-entity here (`<device>_gpio5`). Letting it win would
+    // file every pin of a board as a separate device, which is the opposite of
+    // what identifiers exist to express.
+    assert.equal(
+      uidFromDiscovery(scoped, {
+        unique_id: 'lumen-6f1234_gpio5',
+        device: { identifiers: ['lumen-6f1234'] },
+      }),
+      'lumen-6f1234',
+    );
+  });
+
+  it('uses the node id when a scoped config names no identifiers', () => {
+    assert.equal(uidFromDiscovery(scoped, { unique_id: 'lumen-6f1234_gpio5' }), 'lumen-6f1234');
+  });
+});
+
+describe('channelFromDiscovery', () => {
+  it('is the object id when the config is scoped to a node', () => {
+    assert.equal(
+      channelFromDiscovery({ component: 'switch', objectId: 'gpio5', nodeId: 'lumen-6f1234' }),
+      'gpio5',
+    );
+  });
+
+  it('is null for a device that is one entity', () => {
+    assert.equal(
+      channelFromDiscovery({ component: 'light', objectId: 'lumen-6f1234', nodeId: null }),
+      null,
+    );
+  });
+});
+
+describe('channelFromConfig', () => {
+  it('keeps what the app needs to render a pin', () => {
+    assert.deepEqual(
+      channelFromConfig('gpio5', 'switch', {
+        name: 'Pump',
+        command_topic: 'devices/lumen-6f1234/gpio5/set',
+        device_class: 'outlet',
+        lumen_kind: 'relay',
+        lumen_gpio: 5,
+      }),
+      {
+        channel: 'gpio5',
+        component: 'switch',
+        name: 'Pump',
+        kind: 'relay',
+        deviceClass: 'outlet',
+        unit: null,
+        writable: true,
+        gpio: 5,
+      },
+    );
+  });
+
+  it('marks an entity with no command topic read-only', () => {
+    // A sensor is not commandable, and offering a toggle for one would send a
+    // message the device has nowhere to apply.
+    const sensor = channelFromConfig('gpio3', 'sensor', {
+      name: 'Light level',
+      unit_of_measurement: 'mV',
+      lumen_kind: 'analog',
+    });
+    assert.equal(sensor.writable, false);
+    assert.equal(sensor.unit, 'mV');
   });
 });
 

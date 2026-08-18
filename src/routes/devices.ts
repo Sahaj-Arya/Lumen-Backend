@@ -6,7 +6,13 @@ import { audit } from '../services/audit.js';
 import { config } from '../config.js';
 import { currentUser, requireAuth, requireDeviceAccess, requireHomeRole } from '../auth/guard.js';
 import { generateSecret, hashPassword } from '../auth/password.js';
-import { listUnclaimed, publishCommand, readCachedState, readDiscovered } from '../mqtt/bridge.js';
+import {
+  listUnclaimed,
+  publishCommand,
+  readCachedState,
+  readChannels,
+  readDiscovered,
+} from '../mqtt/bridge.js';
 import { topics } from '../mqtt/topics.js';
 import { query, queryOne } from '../db/index.js';
 
@@ -104,6 +110,16 @@ function decodeClaim(payload: string | z.infer<typeof claimPayload>): z.infer<ty
 }
 
 const commandBody = z.object({
+  /**
+   * Which thing on the device to command -- `gpio5` for the relay on pin 5.
+   * Absent means the device itself, which is right for a board that is one
+   * thing and wrong for one that is a group of things.
+   */
+  channel: z
+    .string()
+    .trim()
+    .regex(/^[A-Za-z0-9_-]{1,32}$/)
+    .optional(),
   // A command is a patch of key -> value, e.g. {"state":"ON","brightness":128}
   // -- Home Assistant's light JSON schema, which is what devices expect.
   patch: z.record(z.union([z.string(), z.number(), z.boolean()])).refine(
@@ -199,7 +215,16 @@ export async function deviceRoutes(app: FastifyInstance): Promise<void> {
       ),
     );
 
-    return { devices: rows.rows.map(present), readings };
+    // Channels come with the list for the same reason as readings: a board
+    // that is a group of things has to render as one on the first paint, not
+    // after the app has opened each device in turn.
+    const channels = Object.fromEntries(
+      await Promise.all(
+        rows.rows.map(async (row) => [row.id, await readChannels(row.device_uid)] as const),
+      ),
+    );
+
+    return { devices: rows.rows.map(present), readings, channels };
   });
 
   /**
@@ -373,7 +398,10 @@ export async function deviceRoutes(app: FastifyInstance): Promise<void> {
       );
     }
 
-    return { device: present(row), readings };
+    // What is wired to the device's pins, if anything. A board with channels
+    // is a group of entities, and the app renders it as one.
+    const channels = await readChannels(row.device_uid);
+    return { device: present(row), readings, channels };
   });
 
   app.patch('/:deviceId', async (request) => {
@@ -447,7 +475,7 @@ export async function deviceRoutes(app: FastifyInstance): Promise<void> {
     const access = await requireDeviceAccess(user.id, deviceId, 'member');
 
     try {
-      const topic = await publishCommand(access.deviceUid, body.patch);
+      const topic = await publishCommand(access.deviceUid, body.patch, body.channel);
       await query(
         `INSERT INTO device_commands (device_id, issued_by, payload, topic, status)
          VALUES ($1, $2, $3::jsonb, $4, 'sent')`,
@@ -460,7 +488,7 @@ export async function deviceRoutes(app: FastifyInstance): Promise<void> {
         subject: access.deviceUid,
         metadata: body.patch,
       });
-      return { ok: true, topic, patch: body.patch };
+      return { ok: true, topic, patch: body.patch, channel: body.channel ?? null };
     } catch (error) {
       await query(
         `INSERT INTO device_commands (device_id, issued_by, payload, topic, status, error)
@@ -469,7 +497,9 @@ export async function deviceRoutes(app: FastifyInstance): Promise<void> {
           deviceId,
           user.id,
           JSON.stringify(body.patch),
-          topics.command(config.MQTT_BASE_TOPIC, access.deviceUid),
+          body.channel
+            ? topics.channelCommand(config.MQTT_BASE_TOPIC, access.deviceUid, body.channel)
+            : topics.command(config.MQTT_BASE_TOPIC, access.deviceUid),
           (error as Error).message,
         ],
       );
