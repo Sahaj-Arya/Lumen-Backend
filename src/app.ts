@@ -28,6 +28,34 @@ export async function buildApp() {
     bodyLimit: 256 * 1024,
   });
 
+  /**
+   * An empty body with a JSON content-type is a client being sloppy, not a
+   * server fault.
+   *
+   * Fastify's default parser rejects it outright, and the generic handler below
+   * turned that into a 500 -- so a DELETE sent with `content-type:
+   * application/json` and nothing after it looked like the server had broken,
+   * for a request that was perfectly answerable. An absent body is read as
+   * absent; malformed JSON is still a 400.
+   */
+  app.addContentTypeParser(
+    'application/json',
+    { parseAs: 'string' },
+    (_request, body: string, done) => {
+      if (!body || body.trim() === '') {
+        done(null, undefined);
+        return;
+      }
+      try {
+        done(null, JSON.parse(body));
+      } catch (error) {
+        const failure = error as Error & { statusCode?: number };
+        failure.statusCode = 400;
+        done(failure, undefined);
+      }
+    },
+  );
+
   await app.register(helmet, { contentSecurityPolicy: false });
   await app.register(cors, {
     origin: config.corsOrigins,
