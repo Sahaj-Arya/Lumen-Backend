@@ -12,6 +12,7 @@ import {
   readCachedState,
   readChannels,
   readDiscovered,
+  typeForChannel,
 } from '../mqtt/bridge.js';
 import { topics } from '../mqtt/topics.js';
 import { query, queryOne } from '../db/index.js';
@@ -110,16 +111,6 @@ function decodeClaim(payload: string | z.infer<typeof claimPayload>): z.infer<ty
 }
 
 const commandBody = z.object({
-  /**
-   * Which thing on the device to command -- `gpio5` for the relay on pin 5.
-   * Absent means the device itself, which is right for a board that is one
-   * thing and wrong for one that is a group of things.
-   */
-  channel: z
-    .string()
-    .trim()
-    .regex(/^[A-Za-z0-9_-]{1,32}$/)
-    .optional(),
   // A command is a patch of key -> value, e.g. {"state":"ON","brightness":128}
   // -- Home Assistant's light JSON schema, which is what devices expect.
   patch: z.record(z.union([z.string(), z.number(), z.boolean()])).refine(
@@ -133,6 +124,8 @@ interface DeviceRow {
   home_id: string;
   group_id: string | null;
   device_uid: string;
+  parent_uid: string | null;
+  channel: string | null;
   name: string;
   type: string;
   manufacturer: string;
@@ -168,6 +161,11 @@ const present = (row: DeviceRow) => ({
   homeId: row.home_id,
   groupId: row.group_id,
   deviceUid: row.device_uid,
+  // Set when this device is one pin of a board. The app shows such devices
+  // normally -- they are ordinary devices -- and only uses these to say which
+  // board a thing lives on.
+  parentUid: row.parent_uid,
+  channel: row.channel,
   name: row.name,
   type: row.type,
   manufacturer: row.manufacturer,
@@ -255,6 +253,16 @@ export async function deviceRoutes(app: FastifyInstance): Promise<void> {
     await requireHomeRole(user.id, homeId, 'member');
 
     const claim = decodeClaim(payload);
+
+    // A board with things on its pins is a group of devices, not one device.
+    // A light and a fan on the same ESP are two things a person switches, and
+    // one row holding both would make every downstream feature -- cards,
+    // automations, scenes, history -- special-case it forever.
+    const channels = await readChannels(claim.id);
+    if (channels.length > 0) {
+      return claimBoard(reply, homeId, user.id, claim, channels);
+    }
+
     // Goes through the same claim as a typed-in id, so the two routes cannot
     // drift on what claiming means.
     return claimDevice(reply, homeId, user.id, {
@@ -264,6 +272,87 @@ export async function deviceRoutes(app: FastifyInstance): Promise<void> {
       model: claim.model,
     });
   });
+
+  /**
+   * Claims every pin of a board as its own device, gathered into one group.
+   *
+   * The group is the board: it says these things share a box and a power
+   * supply. It is an ordinary group though, so a pin can be moved out of it
+   * into a room like any other device -- the grouping is a starting point, not
+   * a cage.
+   *
+   * One credential, not one per pin. The MQTT principal belongs to the board;
+   * the pins are segments beneath it and have nothing of their own to
+   * authenticate.
+   */
+  async function claimBoard(
+    reply: FastifyReply,
+    homeId: string,
+    userId: string,
+    claim: z.infer<typeof claimPayload>,
+    channels: Awaited<ReturnType<typeof readChannels>>,
+  ) {
+    const taken = await queryOne<{ id: string }>(
+      'SELECT id FROM devices WHERE device_uid = $1 OR parent_uid = $1',
+      [claim.id],
+    );
+    if (taken) throw ApiError.conflict('That device id is already claimed');
+
+    const boardName = claim.name || claim.id;
+    const group = await queryOne<{ id: string; name: string }>(
+      `INSERT INTO device_groups (home_id, name, icon)
+       VALUES ($1, $2, 'hardware-chip-outline')
+       RETURNING id, name`,
+      [homeId, boardName],
+    );
+
+    // One password for the board, hashed onto every row that speaks for it, so
+    // rotating it later through any of them keeps them consistent.
+    const mqttPassword = generateSecret(18);
+    const passwordHash = await hashPassword(mqttPassword);
+
+    const created = [];
+    for (const channel of channels) {
+      const row = await queryOne<DeviceRow>(
+        `INSERT INTO devices (home_id, group_id, device_uid, parent_uid, channel, name, type,
+                              model, capabilities, mqtt_password_hash, credential_issued_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10, now())
+         RETURNING *`,
+        [
+          homeId,
+          group!.id,
+          `${claim.id}_${channel.channel}`,
+          claim.id,
+          channel.channel,
+          channel.name || `${boardName} ${channel.channel}`,
+          typeForChannel(channel),
+          claim.model ?? '',
+          JSON.stringify({
+            component: channel.component,
+            ...(channel.kind ? { lumen_kind: channel.kind } : {}),
+            ...(channel.deviceClass ? { device_class: channel.deviceClass } : {}),
+            ...(channel.unit ? { unit_of_measurement: channel.unit } : {}),
+            ...(channel.gpio === null ? {} : { gpio: channel.gpio }),
+          }),
+          passwordHash,
+        ],
+      );
+      created.push(present(row!));
+    }
+
+    await audit({ userId, homeId, action: 'device.claim', subject: claim.id });
+
+    return reply.status(201).send({
+      group,
+      devices: created,
+      credentials: {
+        username: claim.id,
+        password: mqttPassword,
+        endpoint: config.MQTT_URL,
+        note: 'One credential for the whole board. Shown once — register it on the broker with scripts/add-device.mjs and restart the broker.',
+      },
+    });
+  }
 
   app.post('/', async (request, reply) => {
     const user = currentUser(request);
@@ -475,7 +564,11 @@ export async function deviceRoutes(app: FastifyInstance): Promise<void> {
     const access = await requireDeviceAccess(user.id, deviceId, 'member');
 
     try {
-      const topic = await publishCommand(access.deviceUid, body.patch, body.channel);
+      // A pin is commanded on its board's topic. Which board, and which
+      // segment, comes from the device row rather than from the caller: a
+      // client that had to know would be a client that can get it wrong.
+      const target = access.parentUid ?? access.deviceUid;
+      const topic = await publishCommand(target, body.patch, access.channel);
       await query(
         `INSERT INTO device_commands (device_id, issued_by, payload, topic, status)
          VALUES ($1, $2, $3::jsonb, $4, 'sent')`,
@@ -488,7 +581,7 @@ export async function deviceRoutes(app: FastifyInstance): Promise<void> {
         subject: access.deviceUid,
         metadata: body.patch,
       });
-      return { ok: true, topic, patch: body.patch, channel: body.channel ?? null };
+      return { ok: true, topic, patch: body.patch, channel: access.channel };
     } catch (error) {
       await query(
         `INSERT INTO device_commands (device_id, issued_by, payload, topic, status, error)
@@ -497,8 +590,12 @@ export async function deviceRoutes(app: FastifyInstance): Promise<void> {
           deviceId,
           user.id,
           JSON.stringify(body.patch),
-          body.channel
-            ? topics.channelCommand(config.MQTT_BASE_TOPIC, access.deviceUid, body.channel)
+          access.channel
+            ? topics.channelCommand(
+                config.MQTT_BASE_TOPIC,
+                access.parentUid ?? access.deviceUid,
+                access.channel,
+              )
             : topics.command(config.MQTT_BASE_TOPIC, access.deviceUid),
           (error as Error).message,
         ],

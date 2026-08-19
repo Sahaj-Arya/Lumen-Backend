@@ -23,10 +23,32 @@ Node can open a raw TLS socket, so the backend uses the native `mqtts://…:8883
 endpoint rather than the WebSocket one the phone was limited to. Per-user access
 is enforced in the API, not by handing out broker credentials.
 
-## Devices that are groups
+## A board is a group of devices
 
-A board is often not one thing. It is pins, with a relay on one and a sensor on
-another, and each of those is its own entity with its own topics:
+A board is often not one thing. It is pins, with a light on one and a fan on
+another — two things a person switches, so they are **two devices**, gathered
+into a **group** that is the board.
+
+Modelling it the other way round, as one device holding several values, makes
+every downstream feature special-case it forever: cards, automations, scenes,
+history. As separate rows they are ordinary devices everywhere, and the group is
+an ordinary group — so a pin can be moved into a room like anything else. The
+grouping is a starting point, not a cage.
+
+Claiming a board creates the group and one device per pin. Each pin's row
+carries where to publish:
+
+| Column | Holds |
+| --- | --- |
+| `device_uid` | `<board>_gpio5` — its own identity, unique platform-wide |
+| `parent_uid` | `<board>` — the MQTT principal, which the board owns |
+| `channel` | `gpio5` — the segment beneath it |
+
+One credential per board, not per pin: the principal belongs to the board, and
+the pins are segments beneath it with nothing of their own to authenticate.
+
+A client never sends a channel. The backend reads both columns off the row, so
+a caller cannot address the wrong pin. Its topics are:
 
 ```
 devices/<uid>/gpio5/state     retained, that pin's value

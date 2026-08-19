@@ -136,6 +136,22 @@ export async function stopBridge(): Promise<void> {
 
 /** Publishes a command patch. QoS 1, never retained — commands are events. */
 /**
+ * The platform type for a pin, so it renders as the thing it is rather than as
+ * `generic`.
+ *
+ * The kind the firmware declares wins when the catalogue has it -- a `relay` is
+ * a plug, a `motion` is a motion sensor -- and otherwise the component and
+ * device_class are inferred exactly as they are for a whole device.
+ */
+export function typeForChannel(channel: ChannelDescriptor): string {
+  const named = channel.kind ? normalizeType(channel.kind) : null;
+  if (named && Object.hasOwn(DEVICE_TYPES, named)) return named;
+  return typeFromDiscovery(channel.component, {
+    ...(channel.deviceClass ? { device_class: channel.deviceClass } : {}),
+  });
+}
+
+/**
  * What a device's channels are, cached from their discovery configs.
  *
  * Redis rather than a table: the device is the authority and re-announces
@@ -173,9 +189,8 @@ export async function publishCommand(
   if (!client || !connected) {
     throw ApiError.unavailable('Not connected to the MQTT broker');
   }
-  // A device with things on its pins answers per pin. Commanding the device
-  // itself would reach whatever its single-entity firmware does, which for a
-  // board holding a relay and a sensor is nothing.
+  // A pin is addressed under the board that owns the MQTT principal, never
+  // under its own uid -- nothing subscribes to `devices/<board>_gpio5/set`.
   const topic = channel
     ? topics.channelCommand(config.MQTT_BASE_TOPIC, deviceUid, channel)
     : topics.command(config.MQTT_BASE_TOPIC, deviceUid);
@@ -206,6 +221,28 @@ async function lookupDevice(deviceUid: string): Promise<DeviceRow | null> {
   return queryOne<DeviceRow>('SELECT id, status, type FROM devices WHERE device_uid = $1', [
     deviceUid,
   ]);
+}
+
+/**
+ * The device row for one pin of a board.
+ *
+ * A pin is a device in its own right -- its own name, type, group and history
+ * -- reached through the board that owns the MQTT principal.
+ */
+async function lookupChannelDevice(parentUid: string, channel: string): Promise<DeviceRow | null> {
+  return queryOne<DeviceRow>(
+    'SELECT id, status, type FROM devices WHERE parent_uid = $1 AND channel = $2',
+    [parentUid, channel],
+  );
+}
+
+/** The uids of every device living on a board. */
+async function childUids(boardUid: string): Promise<string[]> {
+  const rows = await query<{ device_uid: string }>(
+    'SELECT device_uid FROM devices WHERE parent_uid = $1',
+    [boardUid],
+  );
+  return rows.rows.map((row) => row.device_uid);
 }
 
 /**
@@ -309,31 +346,33 @@ async function handleMessage(topic: string, payload: string, retained: boolean):
   const update: DeviceUpdate = { deviceUid: parsed.deviceUid, at };
   const readings: Record<string, ReadingValue> = {};
 
-  // One pin of a device that has several. Its value is stored under the
-  // channel name, so `gpio5` is the relay's state and `gpio5.brightness` is its
-  // extra -- flat keys the app, the automation engine and the history table all
-  // already understand, rather than a nested shape only new code could read.
+  // One pin of a board. It is its own device, so its values are stored under
+  // ordinary keys -- `state`, `brightness` -- against its own row, and every
+  // part of the system that already understands a device understands it with
+  // no special case: cards, automations, scenes, history.
   if (parsed.channel) {
+    const child = `${parsed.deviceUid}_${parsed.channel}`;
     if (parsed.kind === 'state' || parsed.kind === 'telemetry') {
       if (payload.trim() === '' && retained) {
-        await clearReading(parsed.deviceUid, parsed.channel);
+        await clearReading(child, 'state');
         return;
       }
       const value = parseReadingPayload(payload);
       if (value && typeof value === 'object' && !Array.isArray(value)) {
-        for (const [key, nested] of Object.entries(flatten(value) as Record<string, ReadingValue>)) {
-          // `state` is the channel's own value, not a sub-reading of it.
-          readings[key === 'state' ? parsed.channel : `${parsed.channel}.${key}`] = nested;
-        }
+        Object.assign(readings, flatten(value) as Record<string, ReadingValue>);
       } else if (value !== '') {
-        readings[parsed.channel] = value;
+        // A binary_sensor publishes a bare ON/OFF and an analog pin a number;
+        // both are that device's state.
+        readings.state = value;
       }
     }
-    // Availability per channel is not a thing here: a pin is reachable exactly
-    // when its board is, and the board already publishes that.
+    // A pin has no availability of its own: it is reachable exactly when its
+    // board is, and the board's own topic already says so. See below, where
+    // that presence is copied onto every pin.
     if (Object.keys(readings).length === 0) return;
+    update.deviceUid = child;
     update.readings = readings;
-    await applyUpdate(parsed.deviceUid, update, retained);
+    await applyUpdate(child, update, retained);
     return;
   }
 
@@ -389,6 +428,16 @@ async function handleMessage(topic: string, payload: string, retained: boolean):
 
   update.readings = readings;
   await applyUpdate(parsed.deviceUid, update, retained);
+
+  // A board going offline takes everything wired to it with it. The pins never
+  // say so themselves -- they have no Last Will and no topic of their own for
+  // it -- so without this a board could drop off the network while every one of
+  // its lights still showed as online.
+  if (update.status) {
+    for (const uid of await childUids(parsed.deviceUid)) {
+      await applyUpdate(uid, { deviceUid: uid, at, status: update.status }, retained);
+    }
+  }
 }
 
 /**
@@ -621,10 +670,16 @@ export async function listUnclaimed(): Promise<string[]> {
   }
   if (seen.size === 0) return [];
 
-  const known = await query<{ device_uid: string }>(
-    'SELECT device_uid FROM devices WHERE device_uid = ANY($1)',
+  // A board whose pins are claimed is claimed, even though no row carries its
+  // uid -- its devices are `<board>_gpio5` and their parent_uid is the board.
+  // Without the second column here, every configured board would keep offering
+  // itself as a new device forever.
+  const known = await query<{ uid: string }>(
+    `SELECT device_uid AS uid FROM devices WHERE device_uid = ANY($1)
+     UNION
+     SELECT DISTINCT parent_uid AS uid FROM devices WHERE parent_uid = ANY($1)`,
     [[...seen]],
   );
-  for (const row of known.rows) seen.delete(row.device_uid);
+  for (const row of known.rows) seen.delete(row.uid);
   return [...seen].sort();
 }

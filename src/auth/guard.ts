@@ -92,12 +92,32 @@ export async function requireDeviceAccess(
   userId: string,
   deviceId: string,
   minimum: HomeRole = 'viewer',
-): Promise<{ deviceUid: string; homeId: string; role: HomeRole }> {
-  const device = await queryOne<{ id: string; device_uid: string; home_id: string }>(
-    'SELECT id, device_uid, home_id FROM devices WHERE id = $1',
+): Promise<{
+  deviceUid: string;
+  homeId: string;
+  role: HomeRole;
+  parentUid: string | null;
+  channel: string | null;
+}> {
+  const device = await queryOne<{
+    id: string;
+    device_uid: string;
+    home_id: string;
+    parent_uid: string | null;
+    channel: string | null;
+  }>(
+    'SELECT id, device_uid, home_id, parent_uid, channel FROM devices WHERE id = $1',
     [deviceId],
   );
   if (!device) throw ApiError.notFound('Device not found');
   const role = await requireHomeRole(userId, device.home_id, minimum);
-  return { deviceUid: device.device_uid, homeId: device.home_id, role };
+  return {
+    deviceUid: device.device_uid,
+    homeId: device.home_id,
+    role,
+    // A pin publishes under the board that owns the MQTT principal, so
+    // anything addressing the broker needs both of these, not the pin's uid.
+    parentUid: device.parent_uid,
+    channel: device.channel,
+  };
 }
